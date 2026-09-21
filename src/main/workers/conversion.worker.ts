@@ -1,6 +1,12 @@
 import { parentPort } from 'node:worker_threads'
 import { basename } from 'node:path'
-import { inspectPdf, loadPdfDocument, type PdfPageContent } from '../services/pdfInspector'
+import {
+  inspectPdf,
+  loadPdfDocument,
+  extractPageImages,
+  type PdfPageContent,
+  type PdfPageImage
+} from '../services/pdfInspector'
 import { renderPageToImage, runOcr } from '../services/ocrService'
 import { detectChapters, sanitizePages } from '../services/textSanitizer'
 import { buildChapterBody, buildEpub, type EpubImageInput, type SendProgress } from '../services/epubBuilder'
@@ -30,56 +36,89 @@ function sampleEvenly<T>(items: T[], targetCount: number): T[] {
   return selected
 }
 
-function extractPageText(page: PdfPageContent): string {
+function pageLinesText(page: PdfPageContent): string {
   return (page.lines ?? []).map((line) => line.text).join('\n')
 }
 
-async function ocrAllPages(
+async function ocrPages(
   filePath: string,
-  pageCount: number,
+  pageIndices: number[],
   dpi: number
-): Promise<string[]> {
-  const doc = await loadPdfDocument(filePath)
-  const texts: string[] = []
+): Promise<Map<number, string>> {
+  const results = new Map<number, string>()
+  if (pageIndices.length === 0) {
+    return results
+  }
 
+  const doc = await loadPdfDocument(filePath)
   try {
-    for (let i = 0; i < pageCount; i++) {
-      const imageBuffer = await renderPageToImage(doc, i, dpi)
-      texts.push(await runOcr(imageBuffer, 'por'))
-      makeProgress('ocr', 10 + ((i + 1) / pageCount) * 50)
+    for (let k = 0; k < pageIndices.length; k++) {
+      const pageIndex = pageIndices[k]
+      const imageBuffer = await renderPageToImage(doc, pageIndex, dpi)
+      results.set(pageIndex, await runOcr(imageBuffer, 'por'))
+      makeProgress('ocr', 10 + ((k + 1) / pageIndices.length) * 50)
     }
   } finally {
     await doc.destroy().catch(() => undefined)
   }
 
-  return texts
+  return results
 }
 
-async function renderIllustrations(
+// Sem limite artificial de 10%: páginas marcadas como ilustração são
+// deliberadas (mapas, gravuras). Limita apenas a máximos absolutos.
+const MAX_ILLUSTRATION_PAGES = 40
+const MAX_IMAGES_TOTAL = 120
+
+async function extractIllustrations(
   filePath: string,
   pages: PdfPageContent[],
   dpi: number
-): Promise<{ images: EpubImageInput[]; illustrationIds: Map<number, string> }> {
-  const candidates = pages.filter((page) => page.imageOnly)
-  const targetCount = Math.min(candidates.length, Math.max(1, Math.round(pages.length * 0.1)))
-  if (targetCount <= 0) {
+): Promise<{ images: EpubImageInput[]; illustrationIds: Map<number, string[]> }> {
+  // Páginas com imagem relevantes para o ePub: só-para-imagem (mapas,
+  // gravuras, fotografias de página inteira) ou ilustração (imagem com
+  // texto disperso). Páginas de texto denso não entram.
+  const candidates = pages.filter((page) => page.hasImage && (page.imageOnly || page.illustration))
+  if (candidates.length === 0) {
     return { images: [], illustrationIds: new Map() }
   }
-
-  const chosen = sampleEvenly(candidates, targetCount)
+  const chosen = candidates.length <= MAX_ILLUSTRATION_PAGES ? candidates : sampleEvenly(candidates, MAX_ILLUSTRATION_PAGES)
   const images: EpubImageInput[] = []
-  const illustrationIds = new Map<number, string>()
+  const illustrationIds = new Map<number, string[]>()
 
   const doc = await loadPdfDocument(filePath)
   try {
     for (const page of chosen) {
+      if (images.length >= MAX_IMAGES_TOTAL) {
+        break
+      }
+      let extracted: PdfPageImage[] = []
       try {
-        const buffer = await renderPageToImage(doc, page.index, dpi)
-        const id = `page-${page.index}`
-        images.push({ id, buffer, ext: 'png' })
-        illustrationIds.set(page.index, id)
+        extracted = await extractPageImages(doc, page.index)
       } catch {
-        /* ilustração ignorada */
+        extracted = []
+      }
+      if (extracted.length === 0) {
+        // A página tem imagem mas os recursos não puderam ser descodificados
+        // (padrões, imagem em Form XObject exótico, etc.): rasteriza a página
+        // inteira para que a página só-para-imagem nunca fique de fora.
+        try {
+          const buffer = await renderPageToImage(doc, page.index, dpi)
+          extracted = [{ id: `page-${page.index}`, buffer, ext: 'png', width: 0, height: 0 }]
+        } catch {
+          continue
+        }
+      }
+      const ids: string[] = []
+      for (const image of extracted) {
+        if (images.length >= MAX_IMAGES_TOTAL) {
+          break
+        }
+        images.push({ id: image.id, buffer: image.buffer, ext: image.ext })
+        ids.push(image.id)
+      }
+      if (ids.length > 0) {
+        illustrationIds.set(page.index, ids)
       }
     }
   } finally {
@@ -104,22 +143,34 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
   let pagesWithText: PdfPageContent[]
 
   if (inspection.mode === 'text-layer') {
-    pagesWithText = inspection.pages.map((page) => ({ ...page, text: extractPageText(page) }))
-    const needsOcr = pagesWithText.some((page) => page.imageOnly)
-    if (needsOcr) {
+    // Páginas com imagem e pouco texto (ex.: mapa com nomes de cidades)
+    // tornam-se ilustrações: o texto disperso é descartado para não gerar
+    // falsos capítulos nem parágrafos fragmentados.
+    pagesWithText = inspection.pages.map((page) => ({
+      ...page,
+      text: page.illustration ? '' : pageLinesText(page)
+    }))
+    // OCR apenas nas páginas sem camada de texto (não em todas as páginas).
+    const ocrTargets = pagesWithText.filter((page) => page.imageOnly).map((page) => page.index)
+    if (ocrTargets.length > 0) {
       try {
-        const ocrTexts = await ocrAllPages(filePath, pageCount, dpi)
-        pagesWithText = pagesWithText.map((page, i) => ({
+        const ocrTexts = await ocrPages(filePath, ocrTargets, dpi)
+        pagesWithText = pagesWithText.map((page) => ({
           ...page,
-          text: page.text || ocrTexts[i] || ''
+          text: page.illustration ? '' : page.text || ocrTexts.get(page.index) || ''
         }))
       } catch {
         /* sem tesseract disponível: mantém apenas a camada de texto */
       }
     }
   } else {
-    const ocrTexts = await ocrAllPages(filePath, pageCount, dpi)
-    pagesWithText = inspection.pages.map((page, i) => ({ ...page, text: ocrTexts[i] ?? '' }))
+    let ocrTexts = new Map<number, string>()
+    try {
+      ocrTexts = await ocrPages(filePath, inspection.pages.map((page) => page.index), dpi)
+    } catch {
+      /* sem tesseract: as páginas ficam sem texto e entram como ilustrações */
+    }
+    pagesWithText = inspection.pages.map((page) => ({ ...page, text: ocrTexts.get(page.index) ?? '' }))
   }
 
   makeProgress('sanitize', 65)
@@ -127,25 +178,27 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
 
   makeProgress('segment', 70)
   let images: EpubImageInput[] = []
-  let illustrationIds = new Map<number, string>()
+  let illustrationIds = new Map<number, string[]>()
 
+  makeProgress('images', 72)
   if (inspection.mode === 'text-layer') {
-    makeProgress('images', 72)
-    const rendered = await renderIllustrations(filePath, inspection.pages, dpi)
+    const rendered = await extractIllustrations(filePath, pagesWithText, dpi)
     images = rendered.images
     illustrationIds = rendered.illustrationIds
-    makeProgress('images', 78)
+  } else {
+    // Modo digitalizado: páginas em que o OCR não encontrou texto (em branco
+    // ou apenas imagem) incluem a imagem da página no ePub.
+    const blankPages = pagesWithText.filter((page) => !page.text?.trim() && page.hasImage)
+    const rendered = await extractIllustrations(filePath, blankPages, dpi)
+    images = rendered.images
+    illustrationIds = rendered.illustrationIds
   }
-
-  const interject = (pageIndex: number): string => {
-    const id = illustrationIds.get(pageIndex)
-    return id ? `@image:${id}` : ''
-  }
+  makeProgress('images', 78)
 
   const chapterMarks = Array.isArray(options?.chapterMarks)
-    ? options.chapterMarks.filter((mark): mark is number => typeof mark === 'number' && Number.isFinite(mark))
+    ? options.chapterMarks.filter((mark) => typeof mark === 'number' && Number.isFinite(mark))
     : undefined
-  const chapters = detectChapters(sanitized.paragraphs, interject, chapterMarks)
+  const chapters = detectChapters(sanitized.paragraphs, illustrationIds, chapterMarks, inspection.outline)
 
   makeProgress('build', 80)
   const title = metadata?.title?.trim() || basename(filePath).replace(/\.pdf$/i, '')

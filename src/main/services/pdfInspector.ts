@@ -15,6 +15,25 @@ export interface PdfPageContent {
   lines?: TextLine[]
   text?: string
   imageOnly?: boolean
+  hasImage?: boolean
+  illustration?: boolean
+  /** altura da página em unidades PDF (para regras de posição vertical) */
+  height?: number
+}
+
+export interface PdfPageImage {
+  id: string
+  buffer: Buffer
+  ext: string
+  width: number
+  height: number
+}
+
+/** Entrada do outline nativo do PDF (bookmarks), já resolvida a uma página. */
+export interface PdfOutlineEntry {
+  /** 0-based page index */
+  pageIndex: number
+  title: string
 }
 
 export interface PdfThumbnail {
@@ -27,6 +46,7 @@ export interface PdfInspection {
   pageCount: number
   pages: PdfPageContent[]
   thumbnails?: PdfThumbnail[]
+  outline?: PdfOutlineEntry[]
 }
 
 export interface PdfViewport {
@@ -34,17 +54,35 @@ export interface PdfViewport {
   height: number
 }
 
+interface PdfObjectsLike {
+  has(objId: string): boolean
+  get(objId: string): unknown
+}
+
 export interface PdfPageLike {
   getTextContent(): Promise<{ items: unknown[] }>
+  getOperatorList?(): Promise<{ fnArray?: number[]; argsArray?: unknown[] }>
   getViewport(options: { scale: number }): PdfViewport
   render(options: { canvasContext: unknown; viewport: unknown }): Promise<{ promise?: Promise<void> } | void>
   cleanup(): void
+  objs?: PdfObjectsLike | null
+  commonObjs?: PdfObjectsLike | null
+}
+
+interface PdfOutlineItemLike {
+  title?: unknown
+  dest?: unknown
+  url?: unknown
+  items?: PdfOutlineItemLike[]
 }
 
 export interface PdfDocumentLike {
   numPages: number
   getPage(pageNumber: number): Promise<PdfPageLike>
   destroy(): Promise<void>
+  getOutline?(): Promise<PdfOutlineItemLike[] | null>
+  getDestination?(name: string): Promise<unknown>
+  getPageIndex?(ref: unknown): Promise<number>
 }
 
 interface PdfTextItem {
@@ -118,6 +156,115 @@ function isTextItem(item: unknown): item is PdfTextItem {
   )
 }
 
+const OPS_PER_IMAGE_SCAN = 20000
+
+// Operadores de desenho de imagem (ver OPS de pdfjs-dist): 83
+// paintImageMaskXObject, 84 paintImageMaskXObjectGroup, 85 paintImageXObject,
+// 86 paintInlineImageXObject, 87 paintInlineImageXObjectGroup,
+// 88 paintImageXObjectRepeat, 89 paintImageMaskXObjectRepeat. O 90
+// (paintSolidColorImageMask) fica de fora: é usado para retângulos de cor
+// sólida e geraria falsas deteções em páginas de texto.
+const IMAGE_OPS = new Set([83, 84, 85, 86, 87, 88, 89])
+
+function pageContainsImage(operatorList: { fnArray?: number[]; argsArray?: unknown[] }): boolean {
+  const { fnArray } = operatorList
+  if (!fnArray) {
+    return false
+  }
+
+  for (let i = 0; i < Math.min(fnArray.length, OPS_PER_IMAGE_SCAN); i++) {
+    if (IMAGE_OPS.has(fnArray[i])) {
+      return true
+    }
+  }
+  return false
+}
+
+async function resolveOutlinePageIndex(
+  doc: PdfDocumentLike,
+  item: PdfOutlineItemLike
+): Promise<number> {
+  let dest = item.dest
+  if (typeof dest === 'string') {
+    if (typeof doc.getDestination !== 'function') {
+      return -1
+    }
+    try {
+      dest = await doc.getDestination(dest)
+    } catch {
+      return -1
+    }
+  }
+  if (!Array.isArray(dest) || dest.length === 0) {
+    return -1
+  }
+  const ref = dest[0]
+  if (typeof doc.getPageIndex !== 'function') {
+    return -1
+  }
+  try {
+    // dest[0] é um Ref { num, gen } do pdf.js; alguns produtores usam o
+    // índice da página diretamente.
+    if (ref && typeof ref === 'object' && Number.isFinite((ref as { num?: unknown }).num)) {
+      return await doc.getPageIndex(ref)
+    }
+    if (typeof ref === 'number' && ref >= 0) {
+      return Math.floor(ref)
+    }
+  } catch {
+    return -1
+  }
+  return -1
+}
+
+/**
+ * Lê o outline nativo (bookmarks) do PDF e resolve cada destino à página
+ * 0-based correspondente. As entradas com URL externo, título vazio ou
+ * destino não resolvível são ignoradas. A ordem do documento é preservada
+ * (DFS: pais antes dos filhos).
+ */
+export async function collectOutline(doc: PdfDocumentLike): Promise<PdfOutlineEntry[]> {
+  if (typeof doc.getOutline !== 'function') {
+    return []
+  }
+
+  let items: PdfOutlineItemLike[] | null = null
+  try {
+    items = await doc.getOutline()
+  } catch {
+    return []
+  }
+  if (!Array.isArray(items)) {
+    return []
+  }
+
+  const entries: PdfOutlineEntry[] = []
+  const MAX_OUTLINE_ENTRIES = 500
+  const visited = new Set<PdfOutlineItemLike>()
+
+  const walk = async (list: PdfOutlineItemLike[]): Promise<void> => {
+    for (const item of list) {
+      if (!item || visited.has(item) || entries.length >= MAX_OUTLINE_ENTRIES) {
+        continue
+      }
+      visited.add(item)
+      const title = typeof item?.title === 'string' ? item.title.replace(/\s+/g, ' ').trim() : ''
+      if (title && item.url == null) {
+        const pageIndex = await resolveOutlinePageIndex(doc, item)
+        if (pageIndex >= 0) {
+          entries.push({ pageIndex, title })
+        }
+      }
+      if (Array.isArray(item.items) && item.items.length > 0) {
+        await walk(item.items)
+      }
+    }
+  }
+
+  await walk(items)
+  return entries
+}
+
 export async function inspectPdf(
   pdfPath: string,
   sendProgress: (stage: string, percent: number) => void = () => {}
@@ -139,8 +286,25 @@ export async function inspectPdf(
         const items = textContent.items.filter(isTextItem)
         const lines = groupItemsIntoLines(items)
         const pageChars = items.reduce((acc, item) => acc + item.str.trim().length, 0)
+        let hasImage = false
+        try {
+          if (typeof page.getOperatorList === 'function') {
+            const operatorList = await page.getOperatorList()
+            hasImage = pageContainsImage(operatorList)
+          }
+        } catch {
+          /* assume sem imagem se a análise falhar */
+        }
         totalChars += pageChars
-        pages.push({ index: i, lines, imageOnly: pageChars < 20 })
+        // Página com imagem: é ilustração quando quase não tem texto
+        // (mapas, gravuras, fotografia de página inteira) ou quando o
+        // texto é esparsamente sobreposto à imagem (ex.: nomes de cidades
+        // num mapa). Páginas de texto denso (>400 caracteres) mantêm-se
+        // como texto normal.
+        const imageOnly = pageChars < 20
+        const illustration = hasImage && (imageOnly || pageChars < 400)
+        const height = page.getViewport({ scale: 1 }).height
+        pages.push({ index: i, lines, imageOnly, hasImage, illustration, height })
       } finally {
         try {
           page.cleanup()
@@ -161,13 +325,22 @@ export async function inspectPdf(
       thumbnails = []
     }
 
-    return { mode, pageCount, pages, thumbnails }
+    const outline = await collectOutline(doc)
+
+    return { mode, pageCount, pages, thumbnails, outline }
   } finally {
     await doc.destroy().catch(() => undefined)
   }
 }
 
+const LINE_Y_TOLERANCE = 4
+
 function groupItemsIntoLines(items: PdfTextItem[]): TextLine[] {
+  // Ordem de leitura natural: primeiro de cima para baixo (Y decrescente no
+  // sistema de coordenadas do PDF) e depois da esquerda para a direita (X
+  // crescente). Os itens de texto chegam do pdf.js pela ordem do content
+  // stream, que não corresponde à ordem visual — daí a ordenação espacial
+  // antes de qualquer agrupamento.
   const positioned = items
     .map((item) => ({
       item,
@@ -177,18 +350,28 @@ function groupItemsIntoLines(items: PdfTextItem[]): TextLine[] {
     }))
     .sort((a, b) => b.y - a.y || a.x - b.x)
 
-  const tolerance = 4
-  const groups: { y: number; parts: typeof positioned }[] = []
+  interface Group {
+    baseline: number
+    count: number
+    parts: typeof positioned
+  }
 
+  // Agrupa itens da mesma linha visual: um item entra no grupo quando está
+  // a <= LINE_Y_TOLERANCE do baseline médio do grupo (tolerância ~3-5px para
+  // elementos na mesma linha). O baseline médio absorve o drift gradual de
+  // y dentro da mesma linha sem partir a linha ao meio.
+  const groups: Group[] = []
   for (const part of positioned) {
     if (!part.item.str.trim()) {
       continue
     }
     const current = groups[groups.length - 1]
-    if (current && Math.abs(part.y - current.y) <= tolerance) {
+    if (current && current.baseline - part.y <= LINE_Y_TOLERANCE) {
+      current.baseline = (current.baseline * current.count + part.y) / (current.count + 1)
+      current.count += 1
       current.parts.push(part)
     } else {
-      groups.push({ y: part.y, parts: [part] })
+      groups.push({ baseline: part.y, count: 1, parts: [part] })
     }
   }
 
@@ -218,10 +401,238 @@ function groupItemsIntoLines(items: PdfTextItem[]): TextLine[] {
     if (!cleaned) {
       continue
     }
-    lines.push({ text: cleaned, x: minX, y: group.y, fontSize: Number(fontSize.toFixed(1)) })
+    lines.push({ text: cleaned, x: minX, y: group.baseline, fontSize: Number(fontSize.toFixed(1)) })
   }
 
-  return lines
+  // As linhas já saem em ordem de leitura pela construção; a ordenação final
+  // é uma salvaguarda contra desempates instáveis do agrupamento.
+  return lines.sort((a, b) => b.y - a.y || a.x - b.x)
+}
+
+/** Imagem decodificada como a entrega o pdf.js (display-ready). */
+interface PdfImageDataLike {
+  width?: unknown
+  height?: unknown
+  kind?: unknown
+  data?: unknown
+}
+
+// ImageKind do pdf.js
+const IMAGE_KIND_GRAYSCALE_1BPP = 1
+const IMAGE_KIND_RGB_24BPP = 2
+const IMAGE_KIND_RGBA_32BPP = 3
+
+/** Dimensão mínima para considerar uma imagem como conteúdo real (exclui
+ * bullets e ornamentos). */
+const MIN_IMAGE_SIDE = 16
+const MAX_IMAGES_PER_PAGE = 12
+
+function imageDataToPng(imgData: PdfImageDataLike, canvasModule: any): Buffer | null {
+  const width = typeof imgData.width === 'number' ? imgData.width : 0
+  const height = typeof imgData.height === 'number' ? imgData.height : 0
+  const kind = typeof imgData.kind === 'number' ? imgData.kind : -1
+  const data = imgData.data as Uint8Array | Uint8ClampedArray | undefined
+  if (width <= 0 || height <= 0 || !data || data.length === 0) {
+    return null
+  }
+
+  const rgba = new Uint8ClampedArray(width * height * 4)
+
+  if (kind === IMAGE_KIND_RGB_24BPP) {
+    if (data.length < width * height * 3) {
+      return null
+    }
+    for (let src = 0, dst = 0; src < width * height * 3; src += 3, dst += 4) {
+      rgba[dst] = data[src]
+      rgba[dst + 1] = data[src + 1]
+      rgba[dst + 2] = data[src + 2]
+      rgba[dst + 3] = 255
+    }
+  } else if (kind === IMAGE_KIND_RGBA_32BPP) {
+    if (data.length < width * height * 4) {
+      return null
+    }
+    rgba.set(data.subarray(0, width * height * 4))
+  } else if (kind === IMAGE_KIND_GRAYSCALE_1BPP) {
+    // 1 bit/pixel: bit 0 = preto, bit 1 = branco; linhas alinhadas a byte.
+    const rowBytes = (width + 7) >> 3
+    if (data.length < rowBytes * height) {
+      return null
+    }
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const bit = (data[y * rowBytes + (x >> 3)] >> (7 - (x & 7))) & 1
+        const value = bit ? 255 : 0
+        const dst = (y * width + x) * 4
+        rgba[dst] = value
+        rgba[dst + 1] = value
+        rgba[dst + 2] = value
+        rgba[dst + 3] = 255
+      }
+    }
+  } else {
+    return null
+  }
+
+  try {
+    const canvas = canvasModule.createCanvas(width, height)
+    const context = canvas.getContext('2d')
+    const imageData = context.createImageData(width, height)
+    imageData.data.set(rgba)
+    context.putImageData(imageData, 0, 0)
+    return canvas.toBuffer('image/png')
+  } catch {
+    return null
+  }
+}
+
+function lookupPdfObject(
+  page: PdfPageLike,
+  objId: string
+): PdfImageDataLike | null {
+  const store = objId.startsWith('g_') ? page.commonObjs : page.objs
+  if (!store || typeof store.has !== 'function' || typeof store.get !== 'function') {
+    return null
+  }
+  try {
+    if (!store.has(objId)) {
+      return null
+    }
+    return store.get(objId) as PdfImageDataLike
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Extrai as imagens da página (XObjects de imagem, image masks e imagens
+ * inline) pela ordem de desenho, INDEPENDENTEMENTE de existir texto na
+ * página. Depois de getOperatorList() o pdf.js entrega os pixéis já
+ * descodificados em page.objs / page.commonObjs, ou inline nos args do
+ * operador (masks e inline images).
+ */
+export async function extractPageImages(
+  doc: PdfDocumentLike,
+  pageIndex: number
+): Promise<PdfPageImage[]> {
+  const page = await doc.getPage(pageIndex + 1)
+  try {
+    if (typeof page.getOperatorList !== 'function') {
+      return []
+    }
+    const operatorList = await page.getOperatorList()
+    const { fnArray, argsArray } = operatorList
+    if (!fnArray || !argsArray) {
+      return []
+    }
+
+    const canvasModule = await loadCanvasModule()
+    if (!canvasModule) {
+      return []
+    }
+
+    const images: PdfPageImage[] = []
+    const seenObjIds = new Set<string>()
+    const seenData = new Set<PdfImageDataLike>()
+
+    const pushImage = (imgData: PdfImageDataLike, { forceMask = false, objId = null }: { forceMask?: boolean; objId?: string | null } = {}): void => {
+      if (objId) {
+        if (seenObjIds.has(objId)) {
+          return
+        }
+        seenObjIds.add(objId)
+      } else {
+        if (seenData.has(imgData)) {
+          return
+        }
+        seenData.add(imgData)
+      }
+
+      const normalized: PdfImageDataLike = forceMask
+        ? { ...imgData, kind: IMAGE_KIND_GRAYSCALE_1BPP }
+        : imgData
+
+      const width = typeof normalized.width === 'number' ? normalized.width : 0
+      const height = typeof normalized.height === 'number' ? normalized.height : 0
+      if (Math.min(width, height) < MIN_IMAGE_SIDE) {
+        return
+      }
+      if (images.length >= MAX_IMAGES_PER_PAGE) {
+        return
+      }
+      const buffer = imageDataToPng(normalized, canvasModule)
+      if (!buffer) {
+        return
+      }
+      images.push({ id: `page-${pageIndex}-img-${images.length}`, buffer, ext: 'png', width, height })
+    }
+
+    const pushFromValue = (value: unknown, forceMask = false, objId: string | null = null): void => {
+      if (!value || typeof value !== 'object') {
+        return
+      }
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          pushFromValue(entry, forceMask)
+        }
+        return
+      }
+      pushImage(value as PdfImageDataLike, { forceMask, objId })
+    }
+
+    for (let i = 0; i < Math.min(fnArray.length, OPS_PER_IMAGE_SCAN); i++) {
+      const fn = fnArray[i]
+      const args = argsArray[i] as unknown[] | undefined
+      if (!Array.isArray(args)) {
+        continue
+      }
+      switch (fn) {
+        case 85: // paintImageXObject
+        case 88: {
+          // paintImageXObjectRepeat — dados em page.objs / page.commonObjs
+          const objId = typeof args[0] === 'string' ? args[0] : null
+          if (objId) {
+            const imgData = lookupPdfObject(page, objId)
+            if (imgData) {
+              pushImage(imgData, { objId })
+            }
+          }
+          break
+        }
+        case 86: {
+          // paintInlineImageXObject — imgData vem nos próprios args
+          pushFromValue(args[0])
+          break
+        }
+        case 87: {
+          // paintInlineImageXObjectGroup — args[0] é a lista de imagens
+          pushFromValue(args[0])
+          break
+        }
+        case 83: // paintImageMaskXObject
+        case 89: {
+          // paintImageMaskXObjectRepeat — mask (1bpp) vem nos args
+          pushFromValue(args[0], true)
+          break
+        }
+        case 84: {
+          // paintImageMaskXObjectGroup — args[0] é a lista de masks
+          pushFromValue(args[0], true)
+          break
+        }
+        default:
+          break
+      }
+    }
+
+    return images
+  } finally {
+    try {
+      page.cleanup()
+    } catch {
+      /* página pode já ter sido limpa */
+    }
+  }
 }
 
 async function renderThumbnails(doc: PdfDocumentLike, count = 8, width = 120): Promise<PdfThumbnail[]> {
