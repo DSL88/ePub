@@ -8,6 +8,8 @@ export interface TextLine {
   x: number
   y: number
   fontSize: number
+  /** a linha é desenhada predominantemente com fonte Bold/Black/Heavy */
+  bold?: boolean
 }
 
 export interface PdfPageContent {
@@ -16,6 +18,8 @@ export interface PdfPageContent {
   text?: string
   imageOnly?: boolean
   hasImage?: boolean
+  /** a página tem elementos visuais: imagens raster OU desenhos vetoriais */
+  hasVisual?: boolean
   illustration?: boolean
   /** altura da página em unidades PDF (para regras de posição vertical) */
   height?: number
@@ -89,6 +93,8 @@ interface PdfTextItem {
   str: string
   transform: number[]
   width?: number
+  /** id interno da fonte usada pelo item (ex.: "g_d0_f1") */
+  fontName?: string
 }
 
 const PDFJS_MODULE_PATH = ['pdfjs-dist', 'legacy', 'build', 'pdf.mjs'].join('/')
@@ -156,28 +162,158 @@ function isTextItem(item: unknown): item is PdfTextItem {
   )
 }
 
-const OPS_PER_IMAGE_SCAN = 20000
+const isBoldFontName = /\bbold\b|\bblack\b|\bheavy\b|\bsemi[-_ ]?bold\b|\bbd\b|\bbk\b/i
 
-// Operadores de desenho de imagem (ver OPS de pdfjs-dist): 83
-// paintImageMaskXObject, 84 paintImageMaskXObjectGroup, 85 paintImageXObject,
-// 86 paintInlineImageXObject, 87 paintInlineImageXObjectGroup,
-// 88 paintImageXObjectRepeat, 89 paintImageMaskXObjectRepeat. O 90
-// (paintSolidColorImageMask) fica de fora: é usado para retângulos de cor
-// sólida e geraria falsas deteções em páginas de texto.
-const IMAGE_OPS = new Set([83, 84, 85, 86, 87, 88, 89])
-
-function pageContainsImage(operatorList: { fnArray?: number[]; argsArray?: unknown[] }): boolean {
-  const { fnArray } = operatorList
-  if (!fnArray) {
-    return false
-  }
-
-  for (let i = 0; i < Math.min(fnArray.length, OPS_PER_IMAGE_SCAN); i++) {
-    if (IMAGE_OPS.has(fnArray[i])) {
-      return true
+/**
+ * Conjunto de fontNames usados em peso negrito/ pesado, para deteção
+ * semântica de subtítulos. Combina a flag `bold`/`black` do objeto de fonte
+ * (page.commonObjs) com o nome da fonte, ignorando falhas silenciosamente.
+ */
+function collectBoldFontNames(
+  page: PdfPageLike,
+  items: PdfTextItem[],
+  styles: Record<string, { fontFamily?: unknown } | undefined>
+): Set<string> {
+  const boldNames = new Set<string>()
+  const usedNames = new Set<string>()
+  for (const item of items) {
+    if (item.fontName) {
+      usedNames.add(item.fontName)
     }
   }
-  return false
+  for (const name of usedNames) {
+    const style = styles[name]
+    const styleFamily = typeof style?.fontFamily === 'string' ? style.fontFamily : ''
+    if (isBoldFontName.test(styleFamily)) {
+      boldNames.add(name)
+      continue
+    }
+    const store = page.commonObjs
+    if (!store || typeof store.has !== 'function' || !store.has(name)) {
+      continue
+    }
+    try {
+      const fontObj = store.get(name) as { bold?: unknown; black?: unknown; name?: unknown } | null
+      if (!fontObj || typeof fontObj !== 'object') {
+        continue
+      }
+      const flagged = fontObj.bold === true || fontObj.black === true
+      const named = typeof fontObj.name === 'string' && isBoldFontName.test(fontObj.name)
+      if (flagged || named) {
+        boldNames.add(name)
+      }
+    } catch {
+      /* fonte não acessível: ignora */
+    }
+  }
+  return boldNames
+}
+
+const OPS_PER_IMAGE_SCAN = 20000
+
+/**
+ * Códigos dos operadores de desenho, resolvidos a partir de pdfjsLib.OPS
+ * (nomes estáveis) com fallback para os valores numéricos de pdfjs-dist 4:
+ * 83 paintImageMaskXObject, 84 paintImageMaskXObjectGroup, 85
+ * paintImageXObject, 86 paintInlineImageXObject, 87
+ * paintInlineImageXObjectGroup, 88 paintImageXObjectRepeat, 89
+ * paintImageMaskXObjectRepeat. O 90 (paintSolidColorImageMask) fica de
+ * fora: é usado para retângulos de cor sólida e geraria falsas deteções em
+ * páginas de texto.
+ */
+const IMAGE_OP_FALLBACK = [83, 84, 85, 86, 87, 88, 89]
+
+async function imageOpCodes(): Promise<Set<number>> {
+  try {
+    const pdfjsLib = await loadPdfjs()
+    const OPS = (pdfjsLib as { OPS?: Record<string, number> }).OPS
+    if (OPS) {
+      const names = [
+        'paintImageMaskXObject',
+        'paintImageMaskXObjectGroup',
+        'paintImageXObject',
+        'paintInlineImageXObject',
+        'paintInlineImageXObjectGroup',
+        'paintImageXObjectRepeat',
+        'paintImageMaskXObjectRepeat'
+      ]
+      const codes = names.map((name) => OPS[name]).filter((code) => typeof code === 'number')
+      if (codes.length > 0) {
+        return new Set(codes)
+      }
+    }
+  } catch {
+    /* fallback abaixo */
+  }
+  return new Set(IMAGE_OP_FALLBACK)
+}
+
+/**
+ * Operadores de desenho vetorial (traços, preenchimentos, sombreados). Uma
+ * página com muitos operadores destes e pouco texto é um mapa/gráfico
+ * vetorial — tem de ser rasterizada, senão desaparece do ePub.
+ */
+const VECTOR_OP_FALLBACK = [91, 20, 21, 22, 23, 24, 25, 26, 27, 62] as const
+
+const VECTOR_OP_NAMES = [
+  'constructPath',
+  'stroke',
+  'closeStroke',
+  'fill',
+  'eoFill',
+  'fillStroke',
+  'closeFillStroke',
+  'eoFillStroke',
+  'closeEOFillStroke',
+  'shadingFill'
+] as const
+
+async function vectorOpCodes(): Promise<Set<number>> {
+  try {
+    const pdfjsLib = await loadPdfjs()
+    const OPS = (pdfjsLib as { OPS?: Record<string, number> }).OPS
+    if (OPS) {
+      const codes = VECTOR_OP_NAMES.map((name) => OPS[name]).filter((code) => typeof code === 'number')
+      if (codes.length > 0) {
+        return new Set(codes)
+      }
+    }
+  } catch {
+    /* fallback abaixo */
+  }
+  return new Set(VECTOR_OP_FALLBACK)
+}
+
+/** Operadores vetoriais mínimos para considerar a página "desenhada":
+ * sublinha um-régua (~4 ops) não conta; mapas/gráficos têm dezenas. */
+const MIN_VECTOR_OPS = 10
+
+interface VisualScan {
+  hasImage: boolean
+  vectorOps: number
+}
+
+function scanPageVisuals(
+  operatorList: { fnArray?: number[]; argsArray?: unknown[] },
+  imageOps: Set<number>,
+  vectorOps: Set<number>
+): VisualScan {
+  const { fnArray } = operatorList
+  if (!fnArray) {
+    return { hasImage: false, vectorOps: 0 }
+  }
+
+  let hasImage = false
+  let vectorCount = 0
+  for (let i = 0; i < Math.min(fnArray.length, OPS_PER_IMAGE_SCAN); i++) {
+    const fn = fnArray[i]
+    if (imageOps.has(fn)) {
+      hasImage = true
+    } else if (vectorOps.has(fn)) {
+      vectorCount++
+    }
+  }
+  return { hasImage, vectorOps: vectorCount }
 }
 
 async function resolveOutlinePageIndex(
@@ -278,33 +414,41 @@ export async function inspectPdf(
 
     const pages: PdfPageContent[] = []
     let totalChars = 0
+    const [imageOps, vectorOps] = await Promise.all([imageOpCodes(), vectorOpCodes()])
 
     for (let i = 0; i < pageCount; i++) {
       const page = await doc.getPage(i + 1)
       try {
         const textContent = await page.getTextContent()
         const items = textContent.items.filter(isTextItem)
-        const lines = groupItemsIntoLines(items)
+        const styles = (textContent as { styles?: Record<string, { fontFamily?: unknown } | undefined> }).styles ?? {}
+        const boldFonts = collectBoldFontNames(page, items, styles)
+        const lines = groupItemsIntoLines(items, boldFonts)
         const pageChars = items.reduce((acc, item) => acc + item.str.trim().length, 0)
         let hasImage = false
+        let vectorCount = 0
         try {
           if (typeof page.getOperatorList === 'function') {
             const operatorList = await page.getOperatorList()
-            hasImage = pageContainsImage(operatorList)
+            const scan = scanPageVisuals(operatorList, imageOps, vectorOps)
+            hasImage = scan.hasImage
+            vectorCount = scan.vectorOps
           }
         } catch {
-          /* assume sem imagem se a análise falhar */
+          /* assume sem visuais se a análise falhar */
         }
         totalChars += pageChars
-        // Página com imagem: é ilustração quando quase não tem texto
-        // (mapas, gravuras, fotografia de página inteira) ou quando o
-        // texto é esparsamente sobreposto à imagem (ex.: nomes de cidades
-        // num mapa). Páginas de texto denso (>400 caracteres) mantêm-se
-        // como texto normal.
-        const imageOnly = pageChars < 20
-        const illustration = hasImage && (imageOnly || pageChars < 400)
+        // Página com elementos visuais: é ilustração quando quase não tem
+        // texto legível (< 50 caracteres — mapas, gráficos, gravuras de
+        // página inteira, em raster OU vetores) ou quando tem imagem
+        // raster com texto disperso por cima (< 400 caracteres, ex.: nomes
+        // de cidades num mapa). Páginas só com vetores mas texto denso
+        // (índices com pontilhado, tabelas) mantêm-se como texto normal.
+        const hasVisual = hasImage || vectorCount >= MIN_VECTOR_OPS
+        const imageOnly = pageChars < 50
+        const illustration = imageOnly ? hasVisual : hasImage && pageChars < 400
         const height = page.getViewport({ scale: 1 }).height
-        pages.push({ index: i, lines, imageOnly, hasImage, illustration, height })
+        pages.push({ index: i, lines, imageOnly, hasImage, hasVisual, illustration, height })
       } finally {
         try {
           page.cleanup()
@@ -335,7 +479,7 @@ export async function inspectPdf(
 
 const LINE_Y_TOLERANCE = 4
 
-function groupItemsIntoLines(items: PdfTextItem[]): TextLine[] {
+function groupItemsIntoLines(items: PdfTextItem[], boldFonts: Set<string> = new Set()): TextLine[] {
   // Ordem de leitura natural: primeiro de cima para baixo (Y decrescente no
   // sistema de coordenadas do PDF) e depois da esquerda para a direita (X
   // crescente). Os itens de texto chegam do pdf.js pela ordem do content
@@ -382,9 +526,16 @@ function groupItemsIntoLines(items: PdfTextItem[]): TextLine[] {
     let prevEndX: number | null = null
     let fontSize = 0
     let minX = Infinity
+    let boldChars = 0
+    let totalChars = 0
 
     for (const part of parts) {
       const str = part.item.str
+      const strLen = str.trim().length
+      if (part.item.fontName != null && boldFonts.has(part.item.fontName)) {
+        boldChars += strLen
+      }
+      totalChars += strLen
       if (!text) {
         text = str
       } else {
@@ -401,7 +552,16 @@ function groupItemsIntoLines(items: PdfTextItem[]): TextLine[] {
     if (!cleaned) {
       continue
     }
-    lines.push({ text: cleaned, x: minX, y: group.baseline, fontSize: Number(fontSize.toFixed(1)) })
+    // A linha é "bold" quando a maioria dos caracteres visíveis usa fonte
+    // negrito (subtítulos destacados em peso, não apenas tamanho).
+    const bold = totalChars > 0 && boldChars / totalChars >= 0.6
+    lines.push({
+      text: cleaned,
+      x: minX,
+      y: group.baseline,
+      fontSize: Number(fontSize.toFixed(1)),
+      ...(bold ? { bold: true } : {})
+    })
   }
 
   // As linhas já saem em ordem de leitura pela construção; a ordenação final

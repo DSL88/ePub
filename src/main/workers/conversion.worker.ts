@@ -75,10 +75,10 @@ async function extractIllustrations(
   pages: PdfPageContent[],
   dpi: number
 ): Promise<{ images: EpubImageInput[]; illustrationIds: Map<number, string[]> }> {
-  // Páginas com imagem relevantes para o ePub: só-para-imagem (mapas,
+  // Páginas com visuais relevantes para o ePub: só-para-imagem (mapas,
   // gravuras, fotografias de página inteira) ou ilustração (imagem com
   // texto disperso). Páginas de texto denso não entram.
-  const candidates = pages.filter((page) => page.hasImage && (page.imageOnly || page.illustration))
+  const candidates = pages.filter((page) => page.hasVisual && (page.imageOnly || page.illustration))
   if (candidates.length === 0) {
     return { images: [], illustrationIds: new Map() }
   }
@@ -92,6 +92,22 @@ async function extractIllustrations(
       if (images.length >= MAX_IMAGES_TOTAL) {
         break
       }
+      // Página quase sem texto legível (mapa, gráfico, gravura de página
+      // inteira): rasteriza a página COMPLETA — preserva vetores, legenda e
+      // orientação (incl. paisagem), e a página nunca desaparece do ePub.
+      // A rasterização usa o viewport do pdf.js, que aplica a rotação da
+      // página automaticamente.
+      if (page.imageOnly) {
+        try {
+          const id = `page-${page.index + 1}-full`
+          const buffer = await renderPageToImage(doc, page.index, dpi)
+          images.push({ id, buffer, ext: 'png' })
+          illustrationIds.set(page.index, [id])
+        } catch {
+          /* página impossível de rasterizar: ignora */
+        }
+        continue
+      }
       let extracted: PdfPageImage[] = []
       try {
         extracted = await extractPageImages(doc, page.index)
@@ -101,10 +117,11 @@ async function extractIllustrations(
       if (extracted.length === 0) {
         // A página tem imagem mas os recursos não puderam ser descodificados
         // (padrões, imagem em Form XObject exótico, etc.): rasteriza a página
-        // inteira para que a página só-para-imagem nunca fique de fora.
+        // inteira para que a página ilustração nunca fique de fora.
         try {
+          const id = `page-${page.index + 1}-full`
           const buffer = await renderPageToImage(doc, page.index, dpi)
-          extracted = [{ id: `page-${page.index}`, buffer, ext: 'png', width: 0, height: 0 }]
+          extracted = [{ id, buffer, ext: 'png', width: 0, height: 0 }]
         } catch {
           continue
         }
@@ -150,8 +167,12 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
       ...page,
       text: page.illustration ? '' : pageLinesText(page)
     }))
-    // OCR apenas nas páginas sem camada de texto (não em todas as páginas).
-    const ocrTargets = pagesWithText.filter((page) => page.imageOnly).map((page) => page.index)
+    // OCR apenas nas páginas sem camada de texto e sem visuais: páginas
+    // visuais quase sem texto tornam-se figuras rasterizadas, pelo que o
+    // OCR (descartado nelas) seria tempo perdido.
+    const ocrTargets = pagesWithText
+      .filter((page) => page.imageOnly && !page.hasVisual)
+      .map((page) => page.index)
     if (ocrTargets.length > 0) {
       try {
         const ocrTexts = await ocrPages(filePath, ocrTargets, dpi)
@@ -188,7 +209,7 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
   } else {
     // Modo digitalizado: páginas em que o OCR não encontrou texto (em branco
     // ou apenas imagem) incluem a imagem da página no ePub.
-    const blankPages = pagesWithText.filter((page) => !page.text?.trim() && page.hasImage)
+    const blankPages = pagesWithText.filter((page) => !page.text?.trim() && page.hasVisual)
     const rendered = await extractIllustrations(filePath, blankPages, dpi)
     images = rendered.images
     illustrationIds = rendered.illustrationIds

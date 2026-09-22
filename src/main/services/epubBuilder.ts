@@ -31,8 +31,11 @@ export type SendProgress = (stage: string, percent: number) => void
 const BOOK_CSS = `
 body { font-family: serif; line-height: 1.6; }
 p.book-text { text-indent: 1.4em; margin: 0 0 0.25em 0; text-align: justify; }
+h2.subheading { font-weight: 700; font-size: 1.15em; margin: 1.4em 0 0.6em 0; text-align: left; page-break-after: avoid; }
 div.book-image { margin: 1.4em 0; text-align: center; page-break-inside: avoid; }
 div.book-image img { max-width: 100%; }
+div.full-page-image { margin: 0; text-align: center; page-break-inside: avoid; }
+div.full-page-image img { max-width: 100%; max-height: 100%; }
 h2.book-chapter { text-align: center; margin: 1.2em 0; }
 `.trim()
 
@@ -46,6 +49,15 @@ export function escapeXhtml(text: string): string {
 }
 
 const IMAGE_PLACEHOLDER_RE = /^@image:(.+)$/
+const SUBHEADING_PLACEHOLDER_RE = /^@sub:(.+)$/
+/** imagem de página inteira rasterizada: id "page-<N 1-based>-full" */
+const FULL_PAGE_IMAGE_RE = /^@image:page-(\d+)-full$/
+
+function fullPageImageAlt(id: string): string {
+  const match = id.match(/^page-(\d+)-full$/)
+  const pageNumber = match ? match[1] : id
+  return `Mapa ou ilustração da página ${pageNumber}`
+}
 
 export function buildChapterBody(text: string): string {
   const blocks = text
@@ -55,10 +67,19 @@ export function buildChapterBody(text: string): string {
 
   return blocks
     .map((block) => {
-      const match = block.match(IMAGE_PLACEHOLDER_RE)
-      if (match) {
-        const imageId = escapeXhtml(match[1])
+      const imageMatch = block.match(IMAGE_PLACEHOLDER_RE)
+      if (imageMatch) {
+        const imageId = escapeXhtml(imageMatch[1])
+        // Página rasterizada na íntegra (mapa/gráfico sem texto): figura
+        // dedicada com descrição; imagens dentro do texto ficam genéricas.
+        if (FULL_PAGE_IMAGE_RE.test(block)) {
+          return `<div class="full-page-image"><img src="${imageId}" alt="${escapeXhtml(fullPageImageAlt(imageMatch[1]))}" /></div>`
+        }
         return `<div class="book-image"><img src="${imageId}" alt="" /></div>`
+      }
+      const subMatch = block.match(SUBHEADING_PLACEHOLDER_RE)
+      if (subMatch) {
+        return `<h2 class="subheading">${escapeXhtml(subMatch[1])}</h2>`
       }
       return `<p class="book-text">${escapeXhtml(block)}</p>`
     })
