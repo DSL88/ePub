@@ -38,6 +38,8 @@ export interface PdfOutlineEntry {
   /** 0-based page index */
   pageIndex: number
   title: string
+  /** profundidade no TOC (0 = nível de topo/capítulo) */
+  depth: number
 }
 
 export interface PdfThumbnail {
@@ -162,7 +164,11 @@ function isTextItem(item: unknown): item is PdfTextItem {
   )
 }
 
-const isBoldFontName = /\bbold\b|\bblack\b|\bheavy\b|\bsemi[-_ ]?bold\b|\bbd\b|\bbk\b/i
+// Marcadores de peso pesado em nomes de fonte. Sem word boundaries:
+// nomes como "TimesNewRomanPS-BoldMT" juntam "Bold" a "MT" e \b falharia.
+// "Italic" nunca contém estes marcadores; "Book"/"bk" (peso normal) também
+// não — daí a exclusão de "bk".
+const isBoldFontName = /bold|black|heavy|[-_]bd\b/i
 
 /**
  * Conjunto de fontNames usados em peso negrito/ pesado, para deteção
@@ -357,7 +363,8 @@ async function resolveOutlinePageIndex(
  * Lê o outline nativo (bookmarks) do PDF e resolve cada destino à página
  * 0-based correspondente. As entradas com URL externo, título vazio ou
  * destino não resolvível são ignoradas. A ordem do documento é preservada
- * (DFS: pais antes dos filhos).
+ * (DFS: pais antes dos filhos) e cada entrada guarda a profundidade no TOC
+ * — o consumidor decide que nível corresponde a capítulos.
  */
 export async function collectOutline(doc: PdfDocumentLike): Promise<PdfOutlineEntry[]> {
   if (typeof doc.getOutline !== 'function') {
@@ -378,7 +385,7 @@ export async function collectOutline(doc: PdfDocumentLike): Promise<PdfOutlineEn
   const MAX_OUTLINE_ENTRIES = 500
   const visited = new Set<PdfOutlineItemLike>()
 
-  const walk = async (list: PdfOutlineItemLike[]): Promise<void> => {
+  const walk = async (list: PdfOutlineItemLike[], depth: number): Promise<void> => {
     for (const item of list) {
       if (!item || visited.has(item) || entries.length >= MAX_OUTLINE_ENTRIES) {
         continue
@@ -388,16 +395,16 @@ export async function collectOutline(doc: PdfDocumentLike): Promise<PdfOutlineEn
       if (title && item.url == null) {
         const pageIndex = await resolveOutlinePageIndex(doc, item)
         if (pageIndex >= 0) {
-          entries.push({ pageIndex, title })
+          entries.push({ pageIndex, title, depth })
         }
       }
       if (Array.isArray(item.items) && item.items.length > 0) {
-        await walk(item.items)
+        await walk(item.items, depth + 1)
       }
     }
   }
 
-  await walk(items)
+  await walk(items, 0)
   return entries
 }
 
@@ -421,10 +428,10 @@ export async function inspectPdf(
       try {
         const textContent = await page.getTextContent()
         const items = textContent.items.filter(isTextItem)
-        const styles = (textContent as { styles?: Record<string, { fontFamily?: unknown } | undefined> }).styles ?? {}
-        const boldFonts = collectBoldFontNames(page, items, styles)
-        const lines = groupItemsIntoLines(items, boldFonts)
         const pageChars = items.reduce((acc, item) => acc + item.str.trim().length, 0)
+        // Os operadores têm de vir ANTES da deteção de bold: só depois de
+        // getOperatorList() é que as fontes estão carregadas em
+        // page.commonObjs (com nomes como "TimesNewRomanPS-BoldMT").
         let hasImage = false
         let vectorCount = 0
         try {
@@ -437,6 +444,9 @@ export async function inspectPdf(
         } catch {
           /* assume sem visuais se a análise falhar */
         }
+        const styles = (textContent as { styles?: Record<string, { fontFamily?: unknown } | undefined> }).styles ?? {}
+        const boldFonts = collectBoldFontNames(page, items, styles)
+        const lines = groupItemsIntoLines(items, boldFonts)
         totalChars += pageChars
         // Página com elementos visuais: é ilustração quando quase não tem
         // texto legível (< 50 caracteres — mapas, gráficos, gravuras de

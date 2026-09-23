@@ -10,6 +10,7 @@
     "start": "electron ."
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.89",
     "@radix-ui/react-dialog": "^1.1.2",
     "@radix-ui/react-slider": "^1.2.1",
     "autoprefixer": "^10.4.20",

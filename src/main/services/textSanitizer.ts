@@ -557,11 +557,73 @@ export function detectChapters(
 
   // TOC nativo (bookmarks do PDF): título por página. Entradas repetidas na
   // mesma página resolvem para a última (os filhos vêm depois dos pais).
-  const titleByPage = new Map<number, { title: string; source: 'outline' | 'mark' }>()
-  for (const entry of outline ?? []) {
-    if (entry && entry.pageIndex >= 0 && entry.title) {
-      titleByPage.set(entry.pageIndex, { title: entry.title, source: 'outline' })
+  //
+  // Escolha do nível de capítulo: um TOC pode conter secções e subsecções
+  // (ex.: "1. Some Fundamentals" > "Programming" > "The int Type") — usar
+  // todas promovia subsecções a falsos capítulos. Também pode estar
+  // organizado por PARTES com os capítulos um nível abaixo. Regra em dois
+  // passos:
+  //  1. nível-base = nível mais raso com >= 2 entradas;
+  //  2. desce um nível enquanto os "capítulos" desse nível abrangem muitas
+  //     páginas (gap mediano > 60 entre entradas distantes) — são PARTES,
+  //     não capítulos — e o nível seguinte também tem >= 2 entradas.
+  // No fim ficam de fora apenas os níveis MAIS PROFUNDOS que o escolhido
+  // (secções dentro do capítulo); os níveis mais rasos (partes) mantêm-se
+  // como quebras válidas.
+  const validOutline = (outline ?? [])
+    .filter((entry): entry is PdfOutlineEntry => !!entry && entry.pageIndex >= 0 && !!entry.title)
+    // entrada vinda de fora da app pode não ter profundidade: nível de topo
+    .map((entry) => ({ ...entry, depth: entry.depth ?? 0 }))
+  const entriesByDepth = new Map<number, PdfOutlineEntry[]>()
+  for (const entry of validOutline) {
+    const list = entriesByDepth.get(entry.depth)
+    if (list) {
+      list.push(entry)
+    } else {
+      entriesByDepth.set(entry.depth, [entry])
     }
+  }
+  const depths = [...entriesByDepth.keys()].sort((a, b) => a - b)
+  let chapterEntries = validOutline
+  if (depths.length > 0) {
+    const levelsWithSeveral = depths.filter((depth) => entriesByDepth.get(depth)!.length >= 2)
+    const baseDepth = levelsWithSeveral.length > 0 ? levelsWithSeveral[0] : depths[0]
+
+    /** gap mediano (em páginas) entre entradas consecutivas; só gaps >= 5
+     * contam, para ignorar o bloco de prefácios página a página. */
+    const medianSpread = (entries: PdfOutlineEntry[]): number => {
+      const starts = [...new Set(entries.map((entry) => entry.pageIndex))].sort((a, b) => a - b)
+      const gaps: number[] = []
+      for (let i = 1; i < starts.length; i++) {
+        const gap = starts[i] - starts[i - 1]
+        if (gap >= 5) {
+          gaps.push(gap)
+        }
+      }
+      if (gaps.length === 0) {
+        return 0
+      }
+      gaps.sort((a, b) => a - b)
+      return gaps[Math.floor(gaps.length / 2)]
+    }
+
+    const MAX_CHAPTER_SPREAD = 60
+    let chosenIndex = depths.indexOf(baseDepth)
+    while (
+      chosenIndex < depths.length - 1 &&
+      medianSpread(entriesByDepth.get(depths[chosenIndex])!) > MAX_CHAPTER_SPREAD &&
+      entriesByDepth.get(depths[chosenIndex + 1])!.length >= 2
+    ) {
+      chosenIndex++
+    }
+    const chapterDepth = depths[chosenIndex]
+    chapterEntries = validOutline.filter((entry) => entry.depth <= chapterDepth)
+  }
+  const hasNativeOutline = chapterEntries.length > 0
+
+  const titleByPage = new Map<number, { title: string; source: 'outline' | 'mark' }>()
+  for (const entry of chapterEntries) {
+    titleByPage.set(entry.pageIndex, { title: entry.title, source: 'outline' })
   }
   for (const pageIndex of markPages) {
     // A marca do utilizador prevalece sobre o outline.
@@ -570,7 +632,7 @@ export function detectChapters(
 
   // Com outline nativo válido, a heurística de texto fica desligada: o
   // sumário do documento é a autoridade para as quebras de capítulo.
-  const hasNativeOutline = (outline ?? []).some((entry) => entry && entry.pageIndex >= 0 && entry.title)
+  // (hasNativeOutline calculado acima a partir do nível escolhido.)
 
   const groupsByPage = new Map<number, SanitizedParagraph[]>()
   for (const paragraph of paragraphs) {
