@@ -13,30 +13,108 @@ const OCR_TIMEOUT_MS = 5 * 60 * 1000
 
 export type OcrLanguage = 'por'
 
-export async function runOcr(imageBuffer: Buffer, lang: OcrLanguage = 'por'): Promise<string> {
+/** Resultado do OCR: texto em linhas + confiança média das palavras (0-100).
+ * A confiança distingue páginas bem digitalizadas (>90) de páginas
+ * estilizadas/mapas/rasterizações pobres (<60), que devem ser renderizadas
+ * como imagem e não como texto. */
+export interface OcrResult {
+  text: string
+  meanConfidence: number
+}
+
+export async function runOcr(imageBuffer: Buffer, lang: OcrLanguage = 'por'): Promise<OcrResult> {
   const token = randomBytes(8).toString('hex')
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `epub-ocr-${token}-`))
   const imagePath = path.join(dir, `page-${token}.png`)
-  const outputBase = path.join(dir, `ocr-${token}`)
 
   try {
     await fsp.writeFile(imagePath, imageBuffer)
 
     try {
-      await execFileAsync(
+      // O TSV (em vez do .txt) traz a confiança de cada palavra; o texto é
+      // reconstruído a partir dele, numa única passagem.
+      const { stdout } = await execFileAsync(
         'tesseract',
-        [imagePath, outputBase, '-l', lang, '--psm', '3'],
+        [imagePath, 'stdout', '-l', lang, '--psm', '3', 'tsv'],
         { timeout: OCR_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, windowsHide: true }
       )
+      return parseTesseractTsv(stdout)
     } catch (error) {
       throw translateOcrError(error, lang)
     }
-
-    const textPath = `${outputBase}.txt`
-    return await fsp.readFile(textPath, 'utf8')
   } finally {
     await fsp.rm(dir, { recursive: true, force: true }).catch(() => undefined)
   }
+}
+
+interface TesseractWordRow {
+  lineKey: string
+  parKey: string
+  word: string
+  confidence: number
+}
+
+/**
+ * Reconstrói o texto a partir do TSV do tesseract (nível 5 = palavra),
+ * preservando linhas e parágrafos (mudança de par → linha em branco) e
+ * calculando a confiança média das palavras reconhecidas.
+ */
+export function parseTesseractTsv(tsv: string): OcrResult {
+  const rows = tsv.split(/\r?\n/)
+  const words: TesseractWordRow[] = []
+  for (const raw of rows.slice(1)) {
+    const cols = raw.split('\t')
+    if (cols.length < 12) {
+      continue
+    }
+    const [level, , block, par, line] = cols
+    if (level !== '5') {
+      continue
+    }
+    const word = (cols[11] ?? '').trim()
+    if (!word) {
+      continue
+    }
+    const confidence = Number(cols[10])
+    words.push({
+      lineKey: `${block}:${par}:${line}`,
+      parKey: `${block}:${par}`,
+      word,
+      confidence: Number.isFinite(confidence) ? confidence : 0
+    })
+  }
+
+  const parts: string[] = []
+  let current: TesseractWordRow[] = []
+  let lastParKey: string | null = null
+  let lastLineKey: string | null = null
+
+  const flushLine = (): void => {
+    if (current.length > 0) {
+      parts.push(current.map((entry) => entry.word).join(' '))
+      current = []
+    }
+  }
+
+  for (const entry of words) {
+    if (lastParKey !== null && entry.parKey !== lastParKey) {
+      flushLine()
+      parts.push('')
+    } else if (lastLineKey !== null && entry.lineKey !== lastLineKey) {
+      flushLine()
+    }
+    current.push(entry)
+    lastParKey = entry.parKey
+    lastLineKey = entry.lineKey
+  }
+  flushLine()
+
+  const confidences = words.map((entry) => entry.confidence)
+  const meanConfidence = confidences.length > 0
+    ? confidences.reduce((acc, value) => acc + value, 0) / confidences.length
+    : 0
+
+  return { text: parts.join('\n'), meanConfidence }
 }
 
 function translateOcrError(error: unknown, lang: OcrLanguage): Error {

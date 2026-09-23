@@ -7,7 +7,7 @@ import {
   type PdfPageContent,
   type PdfPageImage
 } from '../services/pdfInspector'
-import { renderPageToImage, runOcr } from '../services/ocrService'
+import { renderPageToImage, runOcr, type OcrResult } from '../services/ocrService'
 import { detectChapters, sanitizePages } from '../services/textSanitizer'
 import { buildChapterBody, buildEpub, type EpubImageInput, type SendProgress } from '../services/epubBuilder'
 import type { ConversionRequestMessage } from '../types'
@@ -44,8 +44,8 @@ async function ocrPages(
   filePath: string,
   pageIndices: number[],
   dpi: number
-): Promise<Map<number, string>> {
-  const results = new Map<number, string>()
+): Promise<Map<number, OcrResult>> {
+  const results = new Map<number, OcrResult>()
   if (pageIndices.length === 0) {
     return results
   }
@@ -69,6 +69,12 @@ async function ocrPages(
 // deliberadas (mapas, gravuras). Limita apenas a máximos absolutos.
 const MAX_ILLUSTRATION_PAGES = 40
 const MAX_IMAGES_TOTAL = 120
+
+// Confiança média do OCR abaixo da qual a página é considerada de leitura
+// pobre (páginas estilizadas de capítulo, mapas, scans rotacionados): o
+// texto reconhecido é lixo e a página é renderizada como imagem. Calibrado
+// em livro real: texto legível ~94-96, páginas estilizadas ~32.
+const LOW_OCR_CONFIDENCE = 65
 
 async function extractIllustrations(
   filePath: string,
@@ -178,20 +184,30 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
         const ocrTexts = await ocrPages(filePath, ocrTargets, dpi)
         pagesWithText = pagesWithText.map((page) => ({
           ...page,
-          text: page.illustration ? '' : page.text || ocrTexts.get(page.index) || ''
+          text: page.illustration ? '' : page.text || ocrTexts.get(page.index)?.text || ''
         }))
       } catch {
         /* sem tesseract disponível: mantém apenas a camada de texto */
       }
     }
   } else {
-    let ocrTexts = new Map<number, string>()
+    let ocrResults = new Map<number, OcrResult>()
     try {
-      ocrTexts = await ocrPages(filePath, inspection.pages.map((page) => page.index), dpi)
+      ocrResults = await ocrPages(filePath, inspection.pages.map((page) => page.index), dpi)
     } catch {
       /* sem tesseract: as páginas ficam sem texto e entram como ilustrações */
     }
-    pagesWithText = inspection.pages.map((page) => ({ ...page, text: ocrTexts.get(page.index) ?? '' }))
+    // Modo digitalizado: cada página é texto (OCR fiável) OU figura (sem
+    // texto reconhecido, ou OCR de má qualidade — páginas estilizadas,
+    // mapas): nesta última a página completa é rasterizada e o texto
+    // reconhecido é descartado, para não gerar falsos capítulos nem
+    // parágrafos fragmentados.
+    pagesWithText = inspection.pages.map((page) => {
+      const ocr = ocrResults.get(page.index)
+      const text = ocr?.text ?? ''
+      const isFigure = !text.trim() || (ocr?.meanConfidence ?? 0) < LOW_OCR_CONFIDENCE
+      return { ...page, illustration: isFigure || page.illustration === true, text: isFigure ? '' : text }
+    })
   }
 
   makeProgress('sanitize', 65)
@@ -207,9 +223,10 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
     images = rendered.images
     illustrationIds = rendered.illustrationIds
   } else {
-    // Modo digitalizado: páginas em que o OCR não encontrou texto (em branco
-    // ou apenas imagem) incluem a imagem da página no ePub.
-    const blankPages = pagesWithText.filter((page) => !page.text?.trim() && page.hasVisual)
+    // Modo digitalizado: páginas classificadas como figura (sem texto
+    // reconhecido ou OCR de má qualidade) incluem a rasterização da página
+    // no ePub.
+    const blankPages = pagesWithText.filter((page) => page.illustration && page.hasVisual)
     const rendered = await extractIllustrations(filePath, blankPages, dpi)
     images = rendered.images
     illustrationIds = rendered.illustrationIds
