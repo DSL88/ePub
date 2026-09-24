@@ -21,6 +21,10 @@ export interface PdfPageContent {
   /** a página tem elementos visuais: imagens raster OU desenhos vetoriais */
   hasVisual?: boolean
   illustration?: boolean
+  /** a página tem pouco texto (< 80 caracteres), com ou sem visuais */
+  sparse?: boolean
+  /** tamanho de fonte dominante do corpo da página (moda de transform[0]) */
+  bodyFontSize?: number
   /** altura da página em unidades PDF (para regras de posição vertical) */
   height?: number
 }
@@ -164,16 +168,19 @@ function isTextItem(item: unknown): item is PdfTextItem {
   )
 }
 
-// Marcadores de peso pesado em nomes de fonte. Sem word boundaries:
-// nomes como "TimesNewRomanPS-BoldMT" juntam "Bold" a "MT" e \b falharia.
-// "Italic" nunca contém estes marcadores; "Book"/"bk" (peso normal) também
-// não — daí a exclusão de "bk".
-const isBoldFontName = /bold|black|heavy|[-_]bd\b/i
+// Marcadores de peso pesado em nomes de fonte. Sem word boundaries para
+// "bold"/"black"/"heavy"/"medium" (nomes como "TimesNewRomanPS-BoldMT" juntam
+// "Bold" a "MT" e \b falharia). "w700"/"700" levam \b para não apanharem
+// fragmentos como "e700". "Italic" nunca contém estes marcadores; "Book"/"bk"
+// (peso normal) também não — daí a exclusão de "bk".
+const isBoldFontName = /bold|black|heavy|medium|[-_]bd\b|\bw?700\b/i
 
 /**
  * Conjunto de fontNames usados em peso negrito/ pesado, para deteção
- * semântica de subtítulos. Combina a flag `bold`/`black` do objeto de fonte
- * (page.commonObjs) com o nome da fonte, ignorando falhas silenciosamente.
+ * semântica de subtítulos. Inspeciona diretamente cada `item.fontName` (o id
+ * do pdf.js é opaco, mas alguns documentos entregam o nome real), o
+ * `fontFamily` do estilo associado e a flag `bold`/`black` do objeto de
+ * fonte (page.commonObjs), ignorando falhas silenciosamente.
  */
 function collectBoldFontNames(
   page: PdfPageLike,
@@ -190,7 +197,7 @@ function collectBoldFontNames(
   for (const name of usedNames) {
     const style = styles[name]
     const styleFamily = typeof style?.fontFamily === 'string' ? style.fontFamily : ''
-    if (isBoldFontName.test(styleFamily)) {
+    if (isBoldFontName.test(name) || isBoldFontName.test(styleFamily)) {
       boldNames.add(name)
       continue
     }
@@ -216,6 +223,39 @@ function collectBoldFontNames(
 }
 
 const OPS_PER_IMAGE_SCAN = 20000
+
+/**
+ * Tamanho padrão da fonte da página: moda de |transform[0]| (escala X =
+ * corpo da fonte) ponderada pelo número de caracteres, sobre TODOS os itens
+ * de `getTextContent()` — o texto corrido do corpo é o que mais repete, pelo
+ * que domina a moda sem filtragem adicional. Fallback para a altura
+ * (hypot de transform[2..3]) quando a escala X é nula (texto rodado).
+ */
+function dominantItemFontSize(items: PdfTextItem[]): number {
+  const weights = new Map<number, number>()
+  for (const item of items) {
+    const text = item.str.trim()
+    if (!text) {
+      continue
+    }
+    const scaleX = Math.abs(item.transform[0])
+    const size = scaleX > 0.1 ? scaleX : Math.hypot(item.transform[2], item.transform[3])
+    if (!(size > 0)) {
+      continue
+    }
+    const key = Math.round(size * 2) / 2
+    weights.set(key, (weights.get(key) ?? 0) + text.length)
+  }
+  let bestSize = 0
+  let bestWeight = 0
+  for (const [size, weight] of weights) {
+    if (weight > bestWeight) {
+      bestSize = size
+      bestWeight = weight
+    }
+  }
+  return bestSize
+}
 
 /**
  * Códigos dos operadores de desenho, resolvidos a partir de pdfjsLib.OPS
@@ -447,18 +487,22 @@ export async function inspectPdf(
         const styles = (textContent as { styles?: Record<string, { fontFamily?: unknown } | undefined> }).styles ?? {}
         const boldFonts = collectBoldFontNames(page, items, styles)
         const lines = groupItemsIntoLines(items, boldFonts)
+        const bodyFontSize = dominantItemFontSize(items)
         totalChars += pageChars
-        // Página com elementos visuais: é ilustração quando quase não tem
-        // texto legível (< 50 caracteres — mapas, gráficos, gravuras de
-        // página inteira, em raster OU vetores) ou quando tem imagem
-        // raster com texto disperso por cima (< 400 caracteres, ex.: nomes
-        // de cidades num mapa). Páginas só com vetores mas texto denso
-        // (índices com pontilhado, tabelas) mantêm-se como texto normal.
+        // Página com elementos visuais (imagem raster OU traçados vetoriais
+        // — nada é descartado por ter o textContent vazio ou reduzido):
+        //   • < 80 caracteres + visuais → mapa/gráfico/gravura: a página
+        //     INTEIRA é rasterizada (imageOnly) e o texto disperso, lixo;
+        //   • imagem raster com 80-400 caracteres de texto disperso (ex.:
+        //     nomes de cidades num mapa raster): extrai as imagens, texto
+        //     descartado. Páginas só com vetores mas texto denso (índices
+        //     com pontilhado, tabelas) mantêm-se como texto normal.
         const hasVisual = hasImage || vectorCount >= MIN_VECTOR_OPS
-        const imageOnly = pageChars < 50
-        const illustration = imageOnly ? hasVisual : hasImage && pageChars < 400
+        const sparse = pageChars < 80
+        const imageOnly = hasVisual && sparse
+        const illustration = imageOnly || (hasImage && pageChars < 400)
         const height = page.getViewport({ scale: 1 }).height
-        pages.push({ index: i, lines, imageOnly, hasImage, hasVisual, illustration, height })
+        pages.push({ index: i, lines, imageOnly, hasImage, hasVisual, illustration, sparse, bodyFontSize, height })
       } finally {
         try {
           page.cleanup()
@@ -532,6 +576,13 @@ function groupItemsIntoLines(items: PdfTextItem[], boldFonts: Set<string> = new 
   const lines: TextLine[] = []
   for (const group of groups) {
     const parts = [...group.parts].sort((a, b) => a.x - b.x)
+    // Análise de estilo ANTES de qualquer concatenação: a flag de negrito de
+    // cada item (via fontName) é calculada isoladamente, para não ser
+    // contaminada pelo texto já unido da linha.
+    const itemStyles = parts.map((part) => ({
+      bold: part.item.fontName != null && boldFonts.has(part.item.fontName),
+      charCount: part.item.str.trim().length
+    }))
     let text = ''
     let prevEndX: number | null = null
     let fontSize = 0
@@ -539,13 +590,13 @@ function groupItemsIntoLines(items: PdfTextItem[], boldFonts: Set<string> = new 
     let boldChars = 0
     let totalChars = 0
 
-    for (const part of parts) {
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
       const str = part.item.str
-      const strLen = str.trim().length
-      if (part.item.fontName != null && boldFonts.has(part.item.fontName)) {
-        boldChars += strLen
+      if (itemStyles[i].bold) {
+        boldChars += itemStyles[i].charCount
       }
-      totalChars += strLen
+      totalChars += itemStyles[i].charCount
       if (!text) {
         text = str
       } else {

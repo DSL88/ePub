@@ -32,6 +32,7 @@ const BOOK_CSS = `
 body { font-family: serif; line-height: 1.6; }
 p.book-text { text-indent: 1.4em; margin: 0 0 0.25em 0; text-align: justify; }
 h2.subheading { font-weight: 700; font-size: 1.15em; margin: 1.4em 0 0.6em 0; text-align: left; page-break-after: avoid; }
+h3.subheading { font-weight: 700; font-size: 1.05em; margin: 1.2em 0 0.5em 0; text-align: left; page-break-after: avoid; }
 div.book-image { margin: 1.4em 0; text-align: center; page-break-inside: avoid; }
 div.book-image img { max-width: 100%; }
 div.full-page-image { margin: 0; text-align: center; page-break-inside: avoid; }
@@ -49,14 +50,15 @@ export function escapeXhtml(text: string): string {
 }
 
 const IMAGE_PLACEHOLDER_RE = /^@image:(.+)$/
-const SUBHEADING_PLACEHOLDER_RE = /^@sub:(.+)$/
+/** `@sub:` = h2 (destaque por tamanho), `@sub3:` = h3 (destaque por peso) */
+const SUBHEADING_PLACEHOLDER_RE = /^@sub(\d?):(.+)$/
 /** imagem de página inteira rasterizada: id "page-<N 1-based>-full" */
 const FULL_PAGE_IMAGE_RE = /^@image:page-(\d+)-full$/
 
 function fullPageImageAlt(id: string): string {
   const match = id.match(/^page-(\d+)-full$/)
   const pageNumber = match ? match[1] : id
-  return `Mapa ou ilustração da página ${pageNumber}`
+  return `Mapa / Imagem (página ${pageNumber})`
 }
 
 export function buildChapterBody(text: string): string {
@@ -79,7 +81,8 @@ export function buildChapterBody(text: string): string {
       }
       const subMatch = block.match(SUBHEADING_PLACEHOLDER_RE)
       if (subMatch) {
-        return `<h2 class="subheading">${escapeXhtml(subMatch[1])}</h2>`
+        const tag = subMatch[1] === '3' ? 'h3' : 'h2'
+        return `<${tag} class="subheading">${escapeXhtml(subMatch[2])}</${tag}>`
       }
       return `<p class="book-text">${escapeXhtml(block)}</p>`
     })

@@ -13,6 +13,8 @@ export interface SanitizedParagraph {
   afterBigGap?: boolean
   /** subtítulo/intertítulo no meio do texto (renderizado como h2/h3) */
   kind?: ParagraphKind
+  /** nível do subtítulo: 2 = h2 (destaque por tamanho), 3 = h3 (destaque apenas em peso) */
+  level?: 2 | 3
 }
 
 export interface SanitizedText {
@@ -63,16 +65,12 @@ const PAGE_NUMBER_RE = /^[\dIVXLCDMivxlcdm]{1,6}\.?$/
 const SUBHEADING_MAX_LENGTH = 80
 /** tamanho mínimo do corpo relativo ao corpo dominante da página */
 const SUBHEADING_SIZE_FACTOR = 1.15
-/** espaçamento vertical mínimo acima/abaixo, relativo ao entrelinhamento */
-const SUBHEADING_GAP_FACTOR = 1.4
 /** proporção mínima de caracteres em fonte negrito para a linha ser bold */
 const SUBHEADING_BOLD_RATIO = 0.6
 
 interface PageLineMetrics {
   /** tamanho de fonte dominante do corpo da página (0 = indeterminado) */
   bodyFontSize: number
-  /** entrelinhamento típico da página (0 = indeterminado) */
-  lineSpacing: number
 }
 
 /**
@@ -101,40 +99,15 @@ function dominantBodyFontSize(lines: TextLine[]): number {
 }
 
 /**
- * Entrelinhamento típico da página: percentil 25 dos espaços verticais
- * entre linhas consecutivas com corpo semelhante. O percentil baixo isola o
- * espaçamento intra-parágrafo (o mais recorrente), ignorando as quebras
- * maiores entre blocos, que contaminariam uma mediana.
- */
-function typicalLineSpacing(lines: TextLine[]): number {
-  const gaps: number[] = []
-  for (let i = 1; i < lines.length; i++) {
-    const gap = lines[i - 1].y - lines[i].y
-    if (gap <= 0 || gap >= Math.max(lines[i - 1].fontSize, lines[i].fontSize) * 3) {
-      continue
-    }
-    gaps.push(gap)
-  }
-  if (gaps.length === 0) {
-    return 0
-  }
-  gaps.sort((a, b) => a - b)
-  return gaps[Math.min(gaps.length - 1, Math.floor(gaps.length * 0.25))]
-}
-
-/**
  * Uma linha funciona como subtítulo quando cumpre TODOS os critérios:
- * tipografia de destaque (tamanho >= 1.15× o corpo OU fonte Bold/Black) +
- * linha curta, maioritariamente letras e sem pontuação terminal de frase +
- * espaçamento vertical acima/abaixo superior ao entrelinhamento regular.
+ * tipografia de destaque (tamanho >= 1.15× o corpo da página OU fonte
+ * Bold/Black/Heavy/Medium) + linha curta, maioritariamente letras e sem
+ * pontuação terminal de frase corrida. A posição vertical (espaçamentos) NÃO
+ * é exigida: um subtítulo a negrito no meio de um parágrafo corrido mantém-se
+ * subtítulo, na sua ordem natural de leitura, em vez de ser rebaixado a <p>.
  * Linhas OCR (sem métricas) nunca são subtítulos.
  */
-function isSubheadingLine(
-  line: TextLine,
-  prev: TextLine | null,
-  next: TextLine | null,
-  metrics: PageLineMetrics
-): boolean {
+function isSubheadingLine(line: TextLine, metrics: PageLineMetrics): boolean {
   if (metrics.bodyFontSize <= 0 || !(line.fontSize > 0)) {
     return false
   }
@@ -146,32 +119,21 @@ function isSubheadingLine(
   if (/[.,;:]$/.test(text)) {
     return false
   }
+  // letra capitular (drop cap): letra isolada grande, sem peso de negrito
+  if (line.bold !== true && text.length <= 3) {
+    return false
+  }
   const letters = text.replace(/[^a-zA-ZÀ-ÖØ-öø-ÿ]/g, '').length
   const nonSpaces = text.replace(/\s/g, '').length
   if (nonSpaces === 0 || letters / nonSpaces < SUBHEADING_BOLD_RATIO) {
     return false
   }
-  const typographic =
-    line.fontSize >= metrics.bodyFontSize * SUBHEADING_SIZE_FACTOR || line.bold === true
-  if (!typographic) {
-    return false
-  }
-  const typical = metrics.lineSpacing > 0 ? metrics.lineSpacing : metrics.bodyFontSize * 1.6
-  const gapAbove = prev ? prev.y - line.y : null
-  const gapBelow = next ? line.y - next.y : null
-  if (gapAbove == null && gapBelow == null) {
-    return true
-  }
-  return (
-    (gapAbove != null && gapAbove > typical * SUBHEADING_GAP_FACTOR) ||
-    (gapBelow != null && gapBelow > typical * SUBHEADING_GAP_FACTOR)
-  )
+  return line.fontSize >= metrics.bodyFontSize * SUBHEADING_SIZE_FACTOR || line.bold === true
 }
 
-function computeLineMetrics(lines: TextLine[]): PageLineMetrics {
+function computeLineMetrics(lines: TextLine[], bodyFontSizeOverride = 0): PageLineMetrics {
   return {
-    bodyFontSize: dominantBodyFontSize(lines),
-    lineSpacing: typicalLineSpacing(lines)
+    bodyFontSize: bodyFontSizeOverride > 0 ? bodyFontSizeOverride : dominantBodyFontSize(lines)
   }
 }
 
@@ -294,25 +256,28 @@ interface PageParagraph {
   firstLineIndex: number
   /** subtítulo tipográfico vs parágrafo normal */
   kind: ParagraphKind
+  /** nível do subtítulo (2 = h2 por tamanho, 3 = h3 por peso) */
+  level: 2 | 3
 }
 
-function buildPageParagraphs(lines: TextLine[], pageHeight: number): PageParagraph[] {
+function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize = 0): PageParagraph[] {
   const firstContentIndex = lines.findIndex((line) => line.text.trim())
-  const metrics = computeLineMetrics(lines)
-  const subheadingAt = lines.map((line, i) =>
-    isSubheadingLine(
-      line,
-      i > 0 ? lines[i - 1] : null,
-      i + 1 < lines.length ? lines[i + 1] : null,
-      metrics
-    )
-  )
+  const metrics = computeLineMetrics(lines, bodyFontSize)
+  // Nível do subtítulo: 2 quando o destaque vem do tamanho (h2), 3 quando
+  // vem apenas do peso da fonte (h3). `false` = não é subtítulo.
+  const subheadingAt = lines.map((line): false | 2 | 3 => {
+    if (!isSubheadingLine(line, metrics)) {
+      return false
+    }
+    return line.fontSize >= metrics.bodyFontSize * SUBHEADING_SIZE_FACTOR ? 2 : 3
+  })
 
   const paragraphs: PageParagraph[] = []
   let parts: string[] = []
   let start = -1
   let afterBigGap = false
   let blockKind: ParagraphKind = 'text'
+  let blockLevel: 2 | 3 = 2
 
   const flush = (): void => {
     const text = parts.join(' ').replace(/\s+/g, ' ').trim()
@@ -322,13 +287,15 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number): PageParagra
         atPageTop: start === firstContentIndex,
         afterBigGap,
         firstLineIndex: start,
-        kind: blockKind
+        kind: blockKind,
+        level: blockLevel
       })
     }
     parts = []
     start = -1
     afterBigGap = false
     blockKind = 'text'
+    blockLevel = 2
   }
 
   for (let i = 0; i < lines.length; i++) {
@@ -339,7 +306,8 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number): PageParagra
       continue
     }
 
-    const lineKind: ParagraphKind = subheadingAt[i] ? 'subheading' : 'text'
+    const lineLevel = subheadingAt[i]
+    const lineKind: ParagraphKind = lineLevel ? 'subheading' : 'text'
     // um subtítulo nunca partilha bloco com o parágrafo: quebra antes e
     // depois, sem forçar quebra de capítulo
     if (parts.length > 0 && blockKind !== lineKind) {
@@ -349,6 +317,7 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number): PageParagra
     if (parts.length === 0) {
       start = i
       blockKind = lineKind
+      blockLevel = lineLevel === false ? 2 : lineLevel
     } else if (i > 0) {
       const prev = lines[i - 1]
       const prevText = prev.text.trimEnd()
@@ -422,7 +391,7 @@ export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
   const paragraphsPerPage = pageLineSets.map((lines, pageIndex) => {
     const withoutFurniture = stripPageFurniture(lines, repeatedHeaders)
     const dehyphenated = dehyphenateLines(withoutFurniture)
-    return buildPageParagraphs(dehyphenated, pages[pageIndex]?.height ?? 0)
+    return buildPageParagraphs(dehyphenated, pages[pageIndex]?.height ?? 0, pages[pageIndex]?.bodyFontSize ?? 0)
   })
 
   // Junção de fragmentos de parágrafo entre páginas: um parágrafo que não
@@ -470,7 +439,8 @@ function toSanitized(para: PageParagraph, pageIndex: number): SanitizedParagraph
     startPage: pageIndex,
     atPageTop: para.atPageTop,
     afterBigGap: para.afterBigGap,
-    kind: para.kind
+    kind: para.kind,
+    level: para.level
   }
 }
 
@@ -492,7 +462,7 @@ export function isChapterMarker(block: string): boolean {
   if (!text || text.length > CHAPTER_TITLE_MAX_LENGTH) {
     return false
   }
-  // placeholders internos (@image:, @sub:) nunca são títulos de capítulo
+  // placeholders internos (@image:, @sub:, @sub3:) nunca são títulos de capítulo
   if (text.startsWith('@')) {
     return false
   }
@@ -650,7 +620,9 @@ export function detectChapters(
   let sawChapterMarker = false
 
   const encodeParagraph = (para: SanitizedParagraph): string =>
-    para.kind === 'subheading' ? `@sub:${para.text}` : para.text
+    para.kind === 'subheading'
+      ? `@sub${para.level === 3 ? '3' : ''}:${para.text}`
+      : para.text
 
   const closeCurrent = (): void => {
     if (current) {
@@ -670,8 +642,9 @@ export function detectChapters(
    * marcador de capítulo + posição/quebra. Marcadores fortes ("Capítulo 3",
    * "Parte II", numerais romanos isolados) valem no topo da página ou após
    * grande espaçamento; títulos genéricos em maiúsculas exigem posição no
-   * topo da página e não podem ser subtítulos tipográficos (esses ficam
-   * como h2 no meio da secção, sem quebrar capítulo).
+   * topo da página. Um título genérico tipográfico (subtítulo em negrito)
+   * no topo da página continua a abrir capítulo; só os subtítulos no MEIO
+   * da secção ficam como h2/h3, sem quebrar capítulo.
    */
   const startsHeuristicChapter = (para: SanitizedParagraph): boolean => {
     if (hasNativeOutline || !isChapterMarker(para.text)) {
@@ -680,7 +653,7 @@ export function detectChapters(
     if (STRONG_CHAPTER_RE.test(para.text) || ROMAN_NUMERAL_RE.test(para.text.trim())) {
       return para.atPageTop === true || para.afterBigGap === true
     }
-    return para.atPageTop === true && para.kind !== 'subheading'
+    return para.atPageTop === true
   }
 
   for (const pageIndex of [...groupsByPage.keys(), ...(illustrations?.keys() ?? [])]
@@ -734,9 +707,10 @@ export function detectChapters(
 
           let title = para.text
           // Títulos em 2 linhas ("CAPÍTULO 3" / "A FUGA"): absorve o bloco
-          // seguinte se também for um marcador.
+          // seguinte se também for um marcador de capítulo — incluindo
+          // subtítulos tipográficos que sejam marcadores.
           const next = pageParas[blockIndex + 1]
-          if (next && next.kind !== 'subheading' && isChapterMarker(next.text)) {
+          if (next && isChapterMarker(next.text)) {
             const joined = `${title} — ${next.text}`
             if (joined.length <= CHAPTER_TITLE_MAX_LENGTH) {
               title = joined
@@ -808,5 +782,5 @@ export function detectChapters(
 }
 
 function normalizeTitle(text: string): string {
-  return text.replace(/^@sub:/, '').replace(/\s+/g, ' ').trim().toLowerCase()
+  return text.replace(/^@sub\d?:/, '').replace(/\s+/g, ' ').trim().toLowerCase()
 }

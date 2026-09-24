@@ -166,18 +166,19 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
   let pagesWithText: PdfPageContent[]
 
   if (inspection.mode === 'text-layer') {
-    // Páginas com imagem e pouco texto (ex.: mapa com nomes de cidades)
-    // tornam-se ilustrações: o texto disperso é descartado para não gerar
-    // falsos capítulos nem parágrafos fragmentados.
+    // Páginas com operadores gráficos e pouco texto (< 80 caracteres, ex.:
+    // mapa vetorial com nomes de cidades) tornam-se ilustrações de página
+    // inteira: o texto disperso é descartado para não gerar falsos capítulos
+    // nem parágrafos fragmentados — a página NUNCA desaparece do ePub.
     pagesWithText = inspection.pages.map((page) => ({
       ...page,
       text: page.illustration ? '' : pageLinesText(page)
     }))
-    // OCR apenas nas páginas sem camada de texto e sem visuais: páginas
-    // visuais quase sem texto tornam-se figuras rasterizadas, pelo que o
-    // OCR (descartado nelas) seria tempo perdido.
+    // OCR apenas nas páginas com pouco texto e SEM visuais (visuais quase
+    // sem texto tornam-se figuras rasterizadas, pelo que o OCR nelas seria
+    // tempo perdido).
     const ocrTargets = pagesWithText
-      .filter((page) => page.imageOnly && !page.hasVisual)
+      .filter((page) => !page.hasVisual && (page.imageOnly || page.sparse))
       .map((page) => page.index)
     if (ocrTargets.length > 0) {
       try {
