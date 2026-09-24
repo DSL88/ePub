@@ -50,6 +50,7 @@ export function escapeXhtml(text: string): string {
 }
 
 const IMAGE_PLACEHOLDER_RE = /^@image:(.+)$/
+const PAGE_BREAK_PLACEHOLDER_RE = /^@pagebreak:(.+)$/
 /** `@sub:` = h2 (destaque por tamanho), `@sub3:` = h3 (destaque por peso) */
 const SUBHEADING_PLACEHOLDER_RE = /^@sub(\d?):(.+)$/
 /** imagem de página inteira rasterizada: id "page-<N 1-based>-full" */
@@ -69,6 +70,12 @@ export function buildChapterBody(text: string): string {
 
   return blocks
     .map((block) => {
+      const pageBreakMatch = block.match(PAGE_BREAK_PLACEHOLDER_RE)
+      if (pageBreakMatch) {
+        const pageNumber = pageBreakMatch[1]
+        const escapedPageNumber = escapeXhtml(pageNumber)
+        return `<span id="page-${escapedPageNumber}" epub:type="pagebreak" title="${escapedPageNumber}" aria-label="Página ${escapedPageNumber}"></span>`
+      }
       const imageMatch = block.match(IMAGE_PLACEHOLDER_RE)
       if (imageMatch) {
         const imageId = escapeXhtml(imageMatch[1])

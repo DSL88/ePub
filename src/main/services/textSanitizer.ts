@@ -19,6 +19,16 @@ export interface SanitizedParagraph {
 
 export interface SanitizedText {
   paragraphs: SanitizedParagraph[]
+  pages: SanitizedPageMetadata[]
+}
+
+export interface SanitizedPageMetadata {
+  /** índice zero-based da página PDF */
+  pageIndex: number
+  physicalPageNumber?: string
+  headerTitle?: string
+  /** cabeçalho não vazio diferente do último cabeçalho identificado */
+  headerChanged?: boolean
 }
 
 export interface DetectedChapter {
@@ -369,6 +379,23 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
 
 export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
   const pageLineSets = pages.map((page) => stripPageNumberLines(pageSourceLines(page)))
+  let previousHeaderTitle = ''
+  const pageMetadata: SanitizedPageMetadata[] = pages.map((page, pageIndex) => {
+    const headerTitle = page.headerTitle?.replace(/\s+/g, ' ').trim() ?? ''
+    const headerChanged =
+      !!headerTitle &&
+      !!previousHeaderTitle &&
+      headerTitle.toLowerCase() !== previousHeaderTitle.toLowerCase()
+    if (headerTitle) {
+      previousHeaderTitle = headerTitle
+    }
+    return {
+      pageIndex,
+      ...(page.physicalPageNumber ? { physicalPageNumber: page.physicalPageNumber } : {}),
+      ...(headerTitle ? { headerTitle } : {}),
+      ...(headerChanged ? { headerChanged: true } : {})
+    }
+  })
 
   const headerCounts = new Map<string, number>()
   for (const lines of pageLineSets) {
@@ -414,9 +441,10 @@ export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
         const continuesMidSentence =
           open.kind !== 'subheading' &&
           para.kind !== 'subheading' &&
+          pageIndex > open.startPage &&
+          para.atPageTop &&
           !SENTENCE_END_RE.test(open.text) &&
-          !isChapterMarker(open.text) &&
-          /^[a-z\u00E0-\u00FF«(\d]/.test(para.text)
+          !isChapterMarker(para.text)
         if (continuesMidSentence) {
           open = { ...open, text: joinParagraphFragments(open.text, para.text) }
         } else {
@@ -430,7 +458,7 @@ export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
     paragraphs.push(open)
   }
 
-  return { paragraphs }
+  return { paragraphs, pages: pageMetadata }
 }
 
 function toSanitized(para: PageParagraph, pageIndex: number): SanitizedParagraph {
@@ -504,7 +532,8 @@ export function detectChapters(
   paragraphs: SanitizedParagraph[],
   illustrations?: Map<number, string[]>,
   explicitMarks?: number[],
-  outline?: PdfOutlineEntry[]
+  outline?: PdfOutlineEntry[],
+  pageMetadata: SanitizedPageMetadata[] = []
 ): DetectedChapter[] {
   interface WorkingChapter {
     title: string
@@ -613,9 +642,12 @@ export function detectChapters(
       groupsByPage.set(paragraph.startPage, [paragraph])
     }
   }
+  const metadataByPage = new Map(pageMetadata.map((page) => [page.pageIndex, page]))
 
   const chapters: WorkingChapter[] = []
   const lead: string[] = []
+  let pendingHeaderTitle = ''
+  let pendingPageBreaks: string[] = []
   let current: WorkingChapter | null = null
   let sawChapterMarker = false
 
@@ -656,13 +688,37 @@ export function detectChapters(
     return para.atPageTop === true
   }
 
-  for (const pageIndex of [...groupsByPage.keys(), ...(illustrations?.keys() ?? [])]
+  for (const pageIndex of [...groupsByPage.keys(), ...(illustrations?.keys() ?? []), ...metadataByPage.keys()]
     .filter((value, index, self) => self.indexOf(value) === index)
     .sort((a, b) => a - b)) {
-    const pageParas = groupsByPage.get(pageIndex) ?? []
-    const chapterHint = titleByPage.get(pageIndex)
+    let pageParas = groupsByPage.get(pageIndex) ?? []
+    const pageMeta = metadataByPage.get(pageIndex)
+    const pageIllustrations = illustrations?.get(pageIndex) ?? []
+    const hasPageContent = pageParas.length > 0 || pageIllustrations.length > 0
+    const chapterHint = hasPageContent ? titleByPage.get(pageIndex) : undefined
+    if (pageMeta?.headerChanged && pageMeta.headerTitle) {
+      pendingHeaderTitle = pageMeta.headerTitle
+    }
+
+    const pageBreaks = [...pendingPageBreaks]
+    pendingPageBreaks = []
+    if (pageMeta?.physicalPageNumber) {
+      pageBreaks.push(`@pagebreak:${pageMeta.physicalPageNumber}`)
+    }
+
+    // Páginas sem texto/ilustrações não abrem capítulos. Os marcadores ficam
+    // no capítulo atual ou aguardam pelo primeiro conteúdo do livro.
+    if (!hasPageContent) {
+      if (current) {
+        current.parts.push(...pageBreaks)
+      } else {
+        pendingPageBreaks.push(...pageBreaks)
+      }
+      continue
+    }
 
     if (chapterHint) {
+      pendingHeaderTitle = ''
       sawChapterMarker = true
       closeCurrent()
 
@@ -697,8 +753,32 @@ export function detectChapters(
         }
       }
 
+      body = [...pageBreaks, ...body]
       current = { title, parts: body, startPage: pageIndex, pinned: true }
     } else {
+      let headerChapterTitle = ''
+      if (pendingHeaderTitle && pageParas.length > 0) {
+        headerChapterTitle = pendingHeaderTitle
+        pendingHeaderTitle = ''
+        closeCurrent()
+        current = { title: headerChapterTitle, parts: [], startPage: pageIndex, pinned: true }
+        sawChapterMarker = true
+
+        // Se o título impresso também aparece no corpo (caso não esteja
+        // totalmente dentro da zona geométrica), não o duplicamos.
+        if (normalizeTitle(pageParas[0].text) === normalizeTitle(headerChapterTitle)) {
+          pageParas = pageParas.slice(1)
+        }
+      }
+
+      if (pageBreaks.length > 0) {
+        if (current) {
+          current.parts.push(...pageBreaks)
+        } else {
+          lead.push(...pageBreaks)
+        }
+      }
+
       for (let blockIndex = 0; blockIndex < pageParas.length; blockIndex++) {
         const para = pageParas[blockIndex]
         if (startsHeuristicChapter(para)) {
@@ -728,9 +808,8 @@ export function detectChapters(
       }
     }
 
-    const ids = illustrations?.get(pageIndex)
-    if (ids?.length) {
-      for (const id of ids) {
+    if (pageIllustrations.length > 0) {
+      for (const id of pageIllustrations) {
         const placeholder = `@image:${id}`
         if (current) {
           current.parts.push(placeholder)

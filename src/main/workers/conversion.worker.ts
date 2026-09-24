@@ -237,7 +237,13 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
   const chapterMarks = Array.isArray(options?.chapterMarks)
     ? options.chapterMarks.filter((mark) => typeof mark === 'number' && Number.isFinite(mark))
     : undefined
-  const chapters = detectChapters(sanitized.paragraphs, illustrationIds, chapterMarks, inspection.outline)
+  const chapters = detectChapters(
+    sanitized.paragraphs,
+    illustrationIds,
+    chapterMarks,
+    inspection.outline,
+    sanitized.pages
+  )
 
   makeProgress('build', 80)
   const title = metadata?.title?.trim() || basename(filePath).replace(/\.pdf$/i, '')

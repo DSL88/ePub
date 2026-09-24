@@ -16,6 +16,10 @@ export interface PdfPageContent {
   index: number
   lines?: TextLine[]
   text?: string
+  /** número impresso na página, extraído do cabeçalho ou rodapé */
+  physicalPageNumber?: string
+  /** título corrente identificado na zona geométrica do cabeçalho */
+  headerTitle?: string
   imageOnly?: boolean
   hasImage?: boolean
   /** a página tem elementos visuais: imagens raster OU desenhos vetoriais */
@@ -27,6 +31,8 @@ export interface PdfPageContent {
   bodyFontSize?: number
   /** altura da página em unidades PDF (para regras de posição vertical) */
   height?: number
+  /** largura da página em unidades PDF */
+  width?: number
 }
 
 export interface PdfPageImage {
@@ -448,6 +454,62 @@ export async function collectOutline(doc: PdfDocumentLike): Promise<PdfOutlineEn
   return entries
 }
 
+const PRINTED_PAGE_NUMBER_RE = /^(?:\d{1,5}|[IVXLCDM]{1,8})[.)]?$/i
+const PAGE_NUMBER_TOKEN_RE = /^(\d{1,5}|[IVXLCDM]{1,8})[.)]?$/i
+
+/**
+ * Separa o número impresso do texto do cabeçalho/rodapé. Números isolados
+ * (incluindo romanos) são a forma mais fiável; também são aceites quando
+ * surgem no início ou no fim da mesma linha do título corrente.
+ */
+function extractHeaderMetadata(lines: TextLine[]): { physicalPageNumber?: string; title: string } {
+  let physicalPageNumber: string | undefined
+  const titleParts: string[] = []
+
+  const rememberNumber = (value: string): void => {
+    if (!physicalPageNumber) {
+      physicalPageNumber = value.replace(/[.)]$/, '').toUpperCase()
+    }
+  }
+
+  for (const line of lines) {
+    let text = line.text.replace(/\s+/g, ' ').trim()
+    if (!text) {
+      continue
+    }
+    if (PRINTED_PAGE_NUMBER_RE.test(text)) {
+      rememberNumber(text)
+      continue
+    }
+
+    const leading = text.match(/^(\S+)(\s+)(.+)$/)
+    if (leading && PAGE_NUMBER_TOKEN_RE.test(leading[1])) {
+      rememberNumber(leading[1])
+      text = leading[3]
+    } else {
+      const trailing = text.match(/^(.+?)(\s+)(\S+)$/)
+      if (trailing && PAGE_NUMBER_TOKEN_RE.test(trailing[3])) {
+        // "CAPÍTULO IV" e "PARTE II" são títulos, não números físicos.
+        const titleEndsInSectionWord = /\b(?:cap[ií]tulo|chapter|parte|part|sec[cç][aã]o|section)$/i.test(trailing[1].trim())
+        if (!titleEndsInSectionWord) {
+          rememberNumber(trailing[3])
+          text = trailing[1]
+        }
+      }
+    }
+
+    const title = text.replace(/^[\s|:;,.–—-]+|[\s|:;,.–—-]+$/g, '').trim()
+    if (title) {
+      titleParts.push(title)
+    }
+  }
+
+  return {
+    ...(physicalPageNumber ? { physicalPageNumber } : {}),
+    title: titleParts.join(' ').replace(/\s+/g, ' ').trim()
+  }
+}
+
 export async function inspectPdf(
   pdfPath: string,
   sendProgress: (stage: string, percent: number) => void = () => {}
@@ -468,7 +530,16 @@ export async function inspectPdf(
       try {
         const textContent = await page.getTextContent()
         const items = textContent.items.filter(isTextItem)
-        const pageChars = items.reduce((acc, item) => acc + item.str.trim().length, 0)
+        const viewport = page.getViewport({ scale: 1.0 })
+        const headerY = viewport.height * 0.92
+        const footerY = viewport.height * 0.06
+        // As transformações dos itens de texto estão no sistema PDF (origem
+        // no fundo): separam-se as zonas antes de agrupar as linhas para que
+        // cabeçalhos/rodapés nunca cheguem ao fluxo do corpo.
+        const headerItems = items.filter((item) => item.transform[5] >= headerY)
+        const footerItems = items.filter((item) => item.transform[5] <= footerY)
+        const bodyItems = items.filter((item) => item.transform[5] < headerY && item.transform[5] > footerY)
+        const pageChars = bodyItems.reduce((acc, item) => acc + item.str.trim().length, 0)
         // Os operadores têm de vir ANTES da deteção de bold: só depois de
         // getOperatorList() é que as fontes estão carregadas em
         // page.commonObjs (com nomes como "TimesNewRomanPS-BoldMT").
@@ -486,8 +557,13 @@ export async function inspectPdf(
         }
         const styles = (textContent as { styles?: Record<string, { fontFamily?: unknown } | undefined> }).styles ?? {}
         const boldFonts = collectBoldFontNames(page, items, styles)
-        const lines = groupItemsIntoLines(items, boldFonts)
-        const bodyFontSize = dominantItemFontSize(items)
+        const headerLines = groupItemsIntoLines(headerItems, boldFonts)
+        const footerLines = groupItemsIntoLines(footerItems, boldFonts)
+        const lines = groupItemsIntoLines(bodyItems, boldFonts)
+        const { physicalPageNumber: headerPageNumber, title: headerTitle } = extractHeaderMetadata(headerLines)
+        const { physicalPageNumber: footerPageNumber } = extractHeaderMetadata(footerLines)
+        const physicalPageNumber = headerPageNumber ?? footerPageNumber
+        const bodyFontSize = dominantItemFontSize(bodyItems)
         totalChars += pageChars
         // Página com elementos visuais (imagem raster OU traçados vetoriais
         // — nada é descartado por ter o textContent vazio ou reduzido):
@@ -501,8 +577,20 @@ export async function inspectPdf(
         const sparse = pageChars < 80
         const imageOnly = hasVisual && sparse
         const illustration = imageOnly || (hasImage && pageChars < 400)
-        const height = page.getViewport({ scale: 1 }).height
-        pages.push({ index: i, lines, imageOnly, hasImage, hasVisual, illustration, sparse, bodyFontSize, height })
+        pages.push({
+          index: i,
+          lines,
+          physicalPageNumber,
+          headerTitle,
+          imageOnly,
+          hasImage,
+          hasVisual,
+          illustration,
+          sparse,
+          bodyFontSize,
+          height: viewport.height,
+          width: viewport.width
+        })
       } finally {
         try {
           page.cleanup()
