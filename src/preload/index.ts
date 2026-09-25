@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
+import type { ExtractionPreview } from '../renderer/src/types'
 
 type Unsubscribe = () => void
 
@@ -24,6 +25,10 @@ const converterAPI = {
     ipcRenderer.invoke('read-pdf', filePath),
   readImage: (filePath: string): Promise<Uint8Array> =>
     ipcRenderer.invoke('read-image', filePath),
+  previewExtraction: (filePath: string, requestId: string): Promise<ExtractionPreview> =>
+    ipcRenderer.invoke('preview-extraction', { filePath, requestId }),
+  cancelExtractionPreview: (requestId: string): Promise<void> =>
+    ipcRenderer.invoke('cancel-extraction-preview', requestId),
   selectCover: (): Promise<{ path: string; name: string } | null> =>
     ipcRenderer.invoke('select-cover'),
   saveEpub: (defaultName: string): Promise<string | null> =>

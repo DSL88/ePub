@@ -2,6 +2,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { Worker } from 'node:worker_threads'
 import type { Dialog, IpcMain, WebContents } from 'electron'
+import type { ExtractionPreview } from '../../renderer/src/types'
 import type {
   ConversionMetadata,
   ConversionOptions,
@@ -11,6 +12,14 @@ import type {
 } from '../types'
 
 let currentWorker: Worker | null = null
+interface ActivePreviewTask {
+  requestId: string
+  cancelled: boolean
+  cancelMessage?: string
+  cancelWorker?: (message: string) => void
+}
+
+let activePreviewTask: ActivePreviewTask | null = null
 
 function compiledWorkerCandidates(): string[] {
   return [
@@ -50,6 +59,167 @@ function resolveWorkerPath(): string {
   throw new Error(
     `Worker de conversão não encontrado: ${compiled}. Corre "npm run build" ou "npm run dev" para o compilar.`
   )
+}
+
+function compiledPreviewWorkerCandidates(): string[] {
+  return [
+    path.join(__dirname, 'workers', 'preview.worker.js'),
+    path.join(__dirname, '..', 'workers', 'preview.worker.js'),
+    path.join(__dirname, '..', '..', 'workers', 'preview.worker.js')
+  ]
+}
+
+function sourcePreviewWorkerCandidates(): string[] {
+  return [
+    path.join(__dirname, '..', '..', 'src', 'main', 'workers', 'preview.worker.ts'),
+    path.join(__dirname, '..', '..', '..', 'src', 'main', 'workers', 'preview.worker.ts')
+  ]
+}
+
+function resolvePreviewWorkerPath(): string {
+  for (const candidate of compiledPreviewWorkerCandidates()) {
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  for (const candidate of sourcePreviewWorkerCandidates()) {
+    if (!fs.existsSync(candidate)) {
+      continue
+    }
+    try {
+      require.resolve('ts-node/register/transpile-only')
+      return candidate
+    } catch {
+      break
+    }
+  }
+
+  const compiled = compiledPreviewWorkerCandidates()[0]
+  throw new Error(
+    `Worker de pré-visualização não encontrado: ${compiled}. Corre "npm run build" ou "npm run dev" para o compilar.`
+  )
+}
+
+function cancelPreviewTask(task: ActivePreviewTask, message: string): void {
+  if (task.cancelled) {
+    return
+  }
+  task.cancelled = true
+  task.cancelMessage = message
+  task.cancelWorker?.(message)
+}
+
+function isExtractionPreview(value: unknown): value is ExtractionPreview {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  const preview = value as Partial<ExtractionPreview>
+  return (
+    (preview.mode === 'text-layer' || preview.mode === 'image-only') &&
+    typeof preview.pageCount === 'number' &&
+    Array.isArray(preview.pages) &&
+    Array.isArray(preview.paragraphs) &&
+    typeof preview.truncated === 'boolean'
+  )
+}
+
+function spawnPreviewWorker(
+  filePath: string,
+  sender: WebContents,
+  task: ActivePreviewTask
+): Promise<ExtractionPreview> {
+  return new Promise((resolve, reject) => {
+    let worker: Worker
+    try {
+      const workerPath = resolvePreviewWorkerPath()
+      worker = workerPath.endsWith('.ts')
+        ? new Worker(workerPath, { execArgv: ['--require', 'ts-node/register/transpile-only'] })
+        : new Worker(workerPath)
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)))
+      return
+    }
+
+    let settled = false
+    const cleanup = (): void => {
+      sender.removeListener('destroyed', onSenderDestroyed)
+      worker.removeAllListeners()
+      task.cancelWorker = undefined
+    }
+
+    const finishWithError = (error: Error): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      void worker.terminate().catch(() => undefined)
+      reject(error)
+    }
+
+    const finishWithPreview = (preview: ExtractionPreview): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      void worker.terminate().catch(() => undefined)
+      resolve(preview)
+    }
+
+    const onSenderDestroyed = (): void => {
+      finishWithError(new Error('A janela foi fechada durante a pré-visualização.'))
+    }
+
+    task.cancelWorker = (message: string): void => {
+      finishWithError(new Error(message))
+    }
+
+    worker.on('message', (message: unknown) => {
+      if (!message || typeof message !== 'object') {
+        finishWithError(new Error('Resposta inválida do worker de pré-visualização.'))
+        return
+      }
+
+      const response = message as { type?: unknown; message?: unknown; preview?: unknown }
+      if (response.type === 'done' && isExtractionPreview(response.preview)) {
+        finishWithPreview(response.preview)
+      } else if (response.type === 'error' && typeof response.message === 'string') {
+        finishWithError(new Error(response.message))
+      } else {
+        finishWithError(new Error('Resposta inválida do worker de pré-visualização.'))
+      }
+    })
+
+    worker.on('error', (error) => finishWithError(error))
+    worker.on('exit', (code) => {
+      if (!settled) {
+        finishWithError(new Error(`A pré-visualização terminou inesperadamente (código ${code}).`))
+      }
+    })
+    sender.once('destroyed', onSenderDestroyed)
+
+    try {
+      worker.postMessage({ type: 'preview', filePath })
+    } catch (error) {
+      finishWithError(error instanceof Error ? error : new Error(String(error)))
+    }
+  })
+}
+
+async function validatePreviewPdfPath(filePath: string): Promise<string> {
+  const resolvedPath = path.resolve(filePath)
+  let stats: fs.Stats
+  try {
+    stats = await fs.promises.stat(resolvedPath)
+  } catch {
+    throw new Error('Ficheiro PDF não encontrado ou sem acesso.')
+  }
+  if (!stats.isFile()) {
+    throw new Error('O caminho indicado não é um ficheiro PDF válido.')
+  }
+  return resolvedPath
 }
 
 function spawnConversionWorker(payload: ConversionRequestMessage, sender: WebContents): Worker {
@@ -159,6 +329,56 @@ export function registerConversionHandlers(ipcMain: IpcMain, dialog: Dialog): vo
     return fs.promises.readFile(filePath)
   })
 
+  ipcMain.handle(
+    'preview-extraction',
+    async (
+      event,
+      payload?: { filePath?: unknown; requestId?: unknown }
+    ): Promise<ExtractionPreview> => {
+      if (!payload || typeof payload.filePath !== 'string' || !payload.filePath.trim()) {
+        throw new Error('Caminho de PDF inválido.')
+      }
+      if (
+        typeof payload.requestId !== 'string' ||
+        payload.requestId.trim().length === 0 ||
+        payload.requestId.length > 128
+      ) {
+        throw new Error('Pedido de pré-visualização inválido.')
+      }
+
+      if (activePreviewTask) {
+        cancelPreviewTask(activePreviewTask, 'A pré-visualização foi substituída por um novo pedido.')
+      }
+      const task: ActivePreviewTask = {
+        requestId: payload.requestId,
+        cancelled: false
+      }
+      activePreviewTask = task
+
+      try {
+        const filePath = await validatePreviewPdfPath(payload.filePath)
+        if (task.cancelled) {
+          throw new Error(task.cancelMessage ?? 'A pré-visualização foi cancelada.')
+        }
+        if (event.sender.isDestroyed()) {
+          throw new Error('A janela foi fechada durante a pré-visualização.')
+        }
+        return await spawnPreviewWorker(filePath, event.sender, task)
+      } finally {
+        if (activePreviewTask === task) {
+          activePreviewTask = null
+        }
+      }
+    }
+  )
+
+  ipcMain.handle('cancel-extraction-preview', (_event, requestId?: unknown): void => {
+    if (typeof requestId !== 'string' || activePreviewTask?.requestId !== requestId) {
+      return
+    }
+    cancelPreviewTask(activePreviewTask, 'A pré-visualização foi cancelada.')
+  })
+
   ipcMain.handle('save-epub', async (_event, defaultName?: string) => showSaveEpubDialog(dialog, defaultName))
 
   ipcMain.handle(
@@ -213,6 +433,12 @@ export function registerConversionHandlers(ipcMain: IpcMain, dialog: Dialog): vo
 }
 
 export function stopCurrentConversion(): void {
+  const previewTask = activePreviewTask
+  activePreviewTask = null
+  if (previewTask) {
+    cancelPreviewTask(previewTask, 'A pré-visualização foi terminada.')
+  }
+
   const worker = currentWorker
   currentWorker = null
   if (worker) {

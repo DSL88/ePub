@@ -15,11 +15,44 @@ export interface ChapterMark {
   pageIndices: number[]
 }
 
+export interface ExtractionPreviewLine {
+  text: string
+  x: number
+  y: number
+  width: number
+  fontSize: number
+  bold: boolean
+}
+
+export interface ExtractionPreviewPage {
+  /** 0-based index in the PDF */
+  index: number
+  width: number
+  height: number
+  lines: ExtractionPreviewLine[]
+}
+
+export interface ExtractionPreviewParagraph {
+  text: string
+  /** 0-based index of the page where this paragraph begins */
+  startPage: number
+}
+
+export interface ExtractionPreview {
+  mode: 'text-layer' | 'image-only'
+  pageCount: number
+  pages: ExtractionPreviewPage[]
+  paragraphs: ExtractionPreviewParagraph[]
+  truncated: boolean
+}
+
 export interface ConverterAPI {
   getPathForFile: (file: File) => string
   selectFile: () => Promise<{ path: string; name: string; size: number } | null>
   readPdf: (filePath: string) => Promise<Uint8Array>
   readImage: (filePath: string) => Promise<Uint8Array>
+  previewExtraction: (filePath: string, requestId: string) => Promise<ExtractionPreview>
+  cancelExtractionPreview: (requestId: string) => Promise<void>
   selectCover: () => Promise<{ path: string; name: string } | null>
   saveEpub: (defaultName: string) => Promise<string | null>
   startConversion: (payload: {

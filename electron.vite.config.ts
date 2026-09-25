@@ -11,7 +11,8 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: 'src/main/index.ts',
-          'workers/conversion.worker': 'src/main/workers/conversion.worker.ts'
+          'workers/conversion.worker': 'src/main/workers/conversion.worker.ts',
+          'workers/preview.worker': 'src/main/workers/preview.worker.ts'
         },
         output: {
           entryFileNames: '[name].js',

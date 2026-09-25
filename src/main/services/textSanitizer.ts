@@ -192,11 +192,22 @@ function stripPageFurniture(lines: TextLine[], repeatedHeaders: Set<string>): Te
 }
 
 /**
- * Junção de hifenização dentro da página: uma linha que termina em "-" é
- * unida à linha seguinte (removendo o hífen quando a próxima começa em
- * minúscula). As coordenadas da primeira linha prevalecem, para que o
- * espaçamento antes do bloco continue a ser medido corretamente.
+ * A physical line-end hyphen is repaired only when the next line is a close,
+ * unindented continuation in the same reading flow. Geometry cannot always
+ * distinguish a lexical hyphen from a discretionary one, so keep non-lowercase
+ * continuations hyphenated and never repair across a column-flow reset.
  */
+const PHYSICAL_LINE_HYPHEN_RE = /[-\u2010]$/
+
+function hasTrailingPhysicalHyphen(text: string): boolean {
+  return PHYSICAL_LINE_HYPHEN_RE.test(text.trimEnd())
+}
+
+function startsWithLowercaseLetter(text: string): boolean {
+  const firstLetter = text.trim().match(/\p{L}/u)?.[0]
+  return !!firstLetter && /\p{Ll}/u.test(firstLetter)
+}
+
 function dehyphenateLines(lines: TextLine[]): TextLine[] {
   const fontSize = dominantBodyFontSize(lines)
   const normalGap = typicalLineGap(lines, fontSize)
@@ -216,9 +227,10 @@ function dehyphenateLines(lines: TextLine[]): TextLine[] {
       const sameTextBlock =
         verticalGap > 0 &&
         verticalGap <= maxLineBreak &&
-        !nextStartsIndented
-      if (prevTrim.endsWith('-') && next && sameTextBlock) {
-        if (/^[a-z\u00E0-\u00FF]/.test(next)) {
+        !nextStartsIndented &&
+        !isReadingFlowReset(prev, line, fontSize)
+      if (hasTrailingPhysicalHyphen(prevTrim) && next && sameTextBlock) {
+        if (startsWithLowercaseLetter(next)) {
           prev.text = prevTrim.slice(0, -1) + next
         } else {
           prev.text = prevTrim + next
@@ -315,17 +327,30 @@ function segmentPage(page: PdfPageContent, pageIndex: number): SegmentedPage {
 const PARAGRAPH_GAP_FACTOR = 1.3
 const PARAGRAPH_FONT_GAP_FACTOR = 1.45
 const MIN_PARAGRAPH_GAP = 5
+/** Top-quarter/bottom-fifth zones are deliberately generous page-edge checks. */
+const PAGE_TOP_CONTINUATION_FRACTION = 0.75
+const PAGE_BOTTOM_CONTINUATION_FRACTION = 0.2
 
 interface PageParagraph {
   text: string
   /** primeiro bloco de conteúdo da página */
   atPageTop: boolean
+  /** primeiro bloco na ordem de leitura, distinto de um bloco apenas alto na página */
+  firstContentBlock: boolean
+  /** primeira linha está fisicamente na zona superior quando há geometria */
+  startsNearPageTop: boolean
   /** precedido de grande espaçamento vertical */
   afterBigGap: boolean
   /** primeira linha alinhada com recuo de parágrafo */
   firstLineIndented: boolean
   /** índice da primeira linha do bloco */
   firstLineIndex: number
+  /** índice da última linha do bloco */
+  lastLineIndex: number
+  /** a posição vertical pode ser comparada com a altura da página */
+  geometryAware: boolean
+  /** última linha chega à zona inferior que normalmente antecede uma viragem */
+  endsNearPageBottom: boolean
   /** subtítulo tipográfico vs parágrafo normal */
   kind: ParagraphKind
   /** nível do subtítulo (2 = h2 por tamanho, 3 = h3 por peso) */
@@ -378,17 +403,74 @@ function commonBodyLeft(lines: TextLine[]): number {
   return left
 }
 
+/**
+ * The ordered line stream can enter a new column even when its baseline does
+ * not rise. Keep the x threshold above the largest ordinary first-line or
+ * hanging indent, and use an absolute delta so RTL column traversal behaves
+ * the same as LTR.
+ */
+function isReadingFlowReset(previous: TextLine, line: TextLine, bodyFontSize = 0): boolean {
+  const fontSize = Math.max(previous.fontSize, line.fontSize, bodyFontSize)
+  const ordinaryIndentLimit = Math.max(fontSize * 3, 24)
+  const horizontalResetThreshold = ordinaryIndentLimit + Math.max(fontSize, 12)
+  return previous.y <= line.y || Math.abs(line.x - previous.x) > horizontalResetThreshold
+}
+
+/**
+ * Finds the common left edge separately for each ordered reading flow. A
+ * column-aware TextLine[] may signal a new column by either a y rise or a
+ * strong x discontinuity, so one page-wide left edge would mistake every line
+ * in later columns for an unindented or excessively indented line.
+ */
+function commonBodyLeftByLine(lines: TextLine[], bodyFontSize = 0): number[] {
+  const leftByLine = new Array<number>(lines.length).fill(0)
+  const flowStarts = [0]
+  let previousContentIndex = -1
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].text.trim()) {
+      continue
+    }
+    if (
+      previousContentIndex >= 0 &&
+      isReadingFlowReset(lines[previousContentIndex], lines[i], bodyFontSize)
+    ) {
+      flowStarts.push(i)
+    }
+    previousContentIndex = i
+  }
+  flowStarts.push(lines.length)
+
+  for (let flowIndex = 0; flowIndex < flowStarts.length - 1; flowIndex++) {
+    const start = flowStarts[flowIndex]
+    const end = flowStarts[flowIndex + 1]
+    if (end <= start) {
+      continue
+    }
+    const left = commonBodyLeft(lines.slice(start, end))
+    for (let i = start; i < end; i++) {
+      leftByLine[i] = left
+    }
+  }
+  return leftByLine
+}
+
 function isIndentedLine(line: TextLine, bodyLeft: number, bodyFontSize: number): boolean {
   const indent = line.x - bodyLeft
   const fontSize = line.fontSize || bodyFontSize
   return indent >= Math.max(fontSize * 0.65, 5) && indent <= Math.max(fontSize * 3, 24)
 }
 
-function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize = 0): PageParagraph[] {
+function buildPageParagraphs(
+  lines: TextLine[],
+  pageHeight: number,
+  bodyFontSize = 0,
+  geometryAware = false
+): PageParagraph[] {
   const firstContentIndex = lines.findIndex((line) => line.text.trim())
   const metrics = computeLineMetrics(lines, bodyFontSize)
   const lineGap = typicalLineGap(lines, metrics.bodyFontSize)
-  const bodyLeft = commonBodyLeft(lines)
+  const bodyLeftByLine = commonBodyLeftByLine(lines, metrics.bodyFontSize)
   // Nível do subtítulo: 2 quando o destaque vem do tamanho (h2), 3 quando
   // vem apenas do peso da fonte (h3). `false` = não é subtítulo.
   const subheadingAt = lines.map((line, index): false | 2 | 3 => {
@@ -400,10 +482,10 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
       MIN_PARAGRAPH_GAP
     )
     const separatedAbove = !!prev && (
-      !prev.text.trim() || prev.y - line.y > gapThreshold
+      !prev.text.trim() || prev.y <= line.y || prev.y - line.y > gapThreshold
     )
     const separatedBelow = !!next && (
-      !next.text.trim() || line.y - next.y > gapThreshold
+      !next.text.trim() || line.y <= next.y || line.y - next.y > gapThreshold
     )
     const prominentAtPageTop =
       index === firstContentIndex &&
@@ -417,6 +499,7 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
   const paragraphs: PageParagraph[] = []
   let parts: string[] = []
   let start = -1
+  let end = -1
   let afterBigGap = false
   let blockKind: ParagraphKind = 'text'
   let blockLevel: 2 | 3 = 2
@@ -425,18 +508,34 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
   const flush = (): void => {
     const text = parts.join(' ').replace(/\s+/g, ' ').trim()
     if (text) {
+      const lastLine = end >= 0 ? lines[end] : undefined
       paragraphs.push({
         text,
         atPageTop: start === firstContentIndex,
+        firstContentBlock: start === firstContentIndex,
+        startsNearPageTop:
+          start === firstContentIndex &&
+          (!geometryAware || (!!lines[start] && lines[start].y >= pageHeight * PAGE_TOP_CONTINUATION_FRACTION)),
         afterBigGap,
-        firstLineIndented: start >= 0 && isIndentedLine(lines[start], bodyLeft, metrics.bodyFontSize),
+        firstLineIndented:
+          start >= 0 && isIndentedLine(lines[start], bodyLeftByLine[start] ?? 0, metrics.bodyFontSize),
         firstLineIndex: start,
+        lastLineIndex: end,
+        geometryAware,
+        // With geometry, an unfinished fragment away from the lower fifth is
+        // ambiguous rather than evidence that the page itself cut the block.
+        endsNearPageBottom:
+          geometryAware &&
+          pageHeight > 0 &&
+          !!lastLine &&
+          lastLine.y <= pageHeight * PAGE_BOTTOM_CONTINUATION_FRACTION,
         kind: blockKind,
         level: blockLevel
       })
     }
     parts = []
     start = -1
+    end = -1
     afterBigGap = false
     blockKind = 'text'
     blockLevel = 2
@@ -472,9 +571,13 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
           fontSize * PARAGRAPH_FONT_GAP_FACTOR,
           MIN_PARAGRAPH_GAP
         )
-      const startsIndentedParagraph = isIndentedLine(line, bodyLeft, fontSize)
+      const startsIndentedParagraph = isIndentedLine(line, bodyLeftByLine[i] ?? 0, fontSize)
+      // The input order is authoritative. Vertical or strong horizontal
+      // discontinuities mark a new reading flow; ordinary indents stay below
+      // the shared x threshold and remain paragraph-level evidence instead.
+      const startsNewReadingFlow = isReadingFlowReset(previousLine, line, metrics.bodyFontSize)
 
-      if (bigGap || startsIndentedParagraph) {
+      if (bigGap || startsIndentedParagraph || startsNewReadingFlow) {
         flush()
         afterBigGap = bigGap
       }
@@ -482,6 +585,7 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
 
     parts.push(raw.trim())
     previousLine = line
+    end = i
   }
   flush()
 
@@ -544,40 +648,77 @@ export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
       ? lines
       : stripPageFurniture(lines, repeatedHeaders)
     const dehyphenated = dehyphenateLines(withoutFurniture)
-    return buildPageParagraphs(dehyphenated, pages[pageIndex]?.height ?? 0, pages[pageIndex]?.bodyFontSize ?? 0)
+    return buildPageParagraphs(
+      dehyphenated,
+      pages[pageIndex]?.height ?? 0,
+      pages[pageIndex]?.bodyFontSize ?? 0,
+      segmentedPages[pageIndex].geometryAware
+    )
   })
 
-  // Junção de parágrafos partidos pela viragem de página. Uma frase pode
-  // terminar sem que o parágrafo tenha terminado; o recuo da página seguinte
-  // distingue um novo parágrafo de uma continuação flush-left.
+  // A falta de recuo, isoladamente, não prova continuação: muitos livros
+  // iniciam novos parágrafos flush-left. Exigimos uma quebra de frase ainda
+  // aberta e, quando há geometria, que o fragmento anterior chegue à margem.
   const paragraphs: SanitizedParagraph[] = []
   let open: SanitizedParagraph | null = null
+  let openPageIndex = -1
+  let openPageHasGeometry = false
+  let openEndsNearPageBottom = false
 
   paragraphsPerPage.forEach((pageParas, pageIndex) => {
-    for (const para of pageParas) {
+    for (let paragraphIndex = 0; paragraphIndex < pageParas.length; paragraphIndex++) {
+      const para = pageParas[paragraphIndex]
       if (!para.text) {
         continue
       }
       if (!open) {
         open = toSanitized(para, pageIndex)
+        openPageIndex = pageIndex
+        openPageHasGeometry = para.geometryAware
+        openEndsNearPageBottom = para.endsNearPageBottom
       } else {
-        // Uma página pode começar com recuo mesmo quando a frase foi cortada
-        // pela margem inferior da anterior. Nesse caso, a falta de pontuação
-        // final confirma a continuação; sem recuo, o parágrafo também pode
-        // continuar depois de uma frase completa.
-        const continuesMidSentence =
-          open.kind !== 'subheading' &&
-          para.kind !== 'subheading' &&
-          pageIndex > open.startPage &&
+        const isAdjacentPageTop =
+          pageIndex === openPageIndex + 1 &&
+          paragraphIndex === 0 &&
+          para.firstContentBlock &&
           para.atPageTop &&
-          (!para.firstLineIndented || !SENTENCE_END_RE.test(open.text)) &&
+          para.startsNearPageTop
+        const isTextFlow =
+          open.kind === 'text' &&
+          para.kind === 'text' &&
           !isChapterMarker(open.text) &&
           !isChapterMarker(para.text)
+        const hasNewParagraphEvidence = para.firstLineIndented || para.afterBigGap
+        const hyphenHasLowercaseContinuation =
+          hasTrailingPhysicalHyphen(open.text) && startsWithLowercaseLetter(para.text)
+        const previousLooksUnfinished =
+          hyphenHasLowercaseContinuation || !SENTENCE_END_RE.test(open.text)
+        // A trailing physical hyphen plus a lowercase next-page start is
+        // stronger evidence than the lower-fifth baseline check alone.
+        const previousReachedPageEdge =
+          !openPageHasGeometry || openEndsNearPageBottom || hyphenHasLowercaseContinuation
+
+        // A terminal sentence is ambiguous even when both blocks are flush-left.
+        // An unfinished fragment (including a trailing hard hyphen) is positive
+        // evidence; indentation/gap, headings, and non-edge geometry veto it.
+        const continuesMidSentence =
+          isAdjacentPageTop &&
+          isTextFlow &&
+          !hasNewParagraphEvidence &&
+          previousLooksUnfinished &&
+          previousReachedPageEdge
+
         if (continuesMidSentence) {
           open = { ...open, text: joinParagraphFragments(open.text, para.text) }
+          openPageIndex = pageIndex
+          openPageHasGeometry = para.geometryAware
+          openEndsNearPageBottom = para.endsNearPageBottom
         } else {
           paragraphs.push(open)
           open = toSanitized(para, pageIndex)
+          openPageIndex = pageIndex
+          openPageHasGeometry = para.geometryAware
+          openEndsNearPageBottom = para.endsNearPageBottom
         }
       }
     }
@@ -602,12 +743,17 @@ function toSanitized(para: PageParagraph, pageIndex: number): SanitizedParagraph
 }
 
 function joinParagraphFragments(prev: string, next: string): string {
-  if (prev.endsWith('-')) {
-    // hífen físico na quebra de página: junta diretamente (dehyphenation
-    // entre páginas)
-    return prev.slice(0, -1) + next
+  const previous = prev.trimEnd()
+  const following = next.trimStart()
+  if (hasTrailingPhysicalHyphen(previous)) {
+    if (startsWithLowercaseLetter(following)) {
+      // Repair only lowercase word continuations; uppercase starts keep their
+      // hyphen because a lexical hyphen is otherwise indistinguishable.
+      return previous.slice(0, -1) + following
+    }
+    return previous + following
   }
-  return `${prev} ${next}`
+  return `${previous} ${following}`
 }
 
 const CHAPTER_TITLE_MAX_LENGTH = 70

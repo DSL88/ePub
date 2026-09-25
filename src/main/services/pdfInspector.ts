@@ -14,6 +14,24 @@ export interface TextLine {
   bold?: boolean
 }
 
+/** Geometria normalizada de um item PDF.js, usada pelo layout puro abaixo. */
+export interface PdfTextLayoutItem {
+  str: string
+  x: number
+  y: number
+  fontSize: number
+  width?: number
+  height?: number
+  dir?: string
+  hasEOL?: boolean
+  bold?: boolean
+}
+
+export interface PdfTextLayoutOptions {
+  /** Permutação completa dos índices dos itens não vazios, em ordem lógica. */
+  logicalOrder?: readonly number[]
+}
+
 export interface PdfPageContent {
   index: number
   lines?: TextLine[]
@@ -78,7 +96,8 @@ interface PdfObjectsLike {
 }
 
 export interface PdfPageLike {
-  getTextContent(): Promise<{ items: unknown[] }>
+  getTextContent(options?: { includeMarkedContent?: boolean }): Promise<{ items: unknown[] }>
+  getStructTree?(): Promise<unknown>
   getOperatorList?(): Promise<{ fnArray?: number[]; argsArray?: unknown[] }>
   getViewport(options: { scale: number }): PdfViewport
   render(options: { canvasContext: unknown; viewport: unknown }): Promise<{ promise?: Promise<void> } | void>
@@ -107,6 +126,9 @@ interface PdfTextItem {
   str: string
   transform: number[]
   width?: number
+  height?: number
+  dir?: string
+  hasEOL?: boolean
   /** id interno da fonte usada pelo item (ex.: "g_d0_f1") */
   fontName?: string
 }
@@ -173,6 +195,173 @@ function isTextItem(item: unknown): item is PdfTextItem {
     typeof candidate.str === 'string' &&
     Array.isArray(candidate.transform) &&
     candidate.transform.length >= 6
+  )
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isTextContentItem(item: unknown): item is { str: string } {
+  return isObjectRecord(item) && typeof item.str === 'string'
+}
+
+/** Lê IDs de conteúdo apenas de uma árvore PDF.js completa e bem formada. */
+function collectStructContentIds(tree: unknown): string[] | null {
+  if (!isObjectRecord(tree) || tree.role !== 'Root' || !Array.isArray(tree.children)) {
+    return null
+  }
+
+  const ids: string[] = []
+  const visited = new WeakSet<object>([tree])
+  let visitedCount = 0
+  const MAX_STRUCT_NODES = 20000
+  const MAX_STRUCT_DEPTH = 64
+
+  const visitChildren = (children: unknown[], depth: number): boolean => {
+    if (depth > MAX_STRUCT_DEPTH) {
+      return false
+    }
+    for (const child of children) {
+      if (!isObjectRecord(child) || visited.has(child)) {
+        return false
+      }
+      visited.add(child)
+      visitedCount++
+      if (visitedCount > MAX_STRUCT_NODES) {
+        return false
+      }
+
+      if (child.type === 'content') {
+        if (typeof child.id !== 'string' || !child.id) {
+          return false
+        }
+        ids.push(child.id)
+      } else if (child.type === 'object' || child.type === 'annotation') {
+        // Object and annotation references are valid non-text leaves, not MCIDs.
+        if (typeof child.id !== 'string' || !child.id) {
+          return false
+        }
+      } else if (typeof child.role === 'string' && Array.isArray(child.children)) {
+        if (!visitChildren(child.children, depth + 1)) {
+          return false
+        }
+      } else {
+        return false
+      }
+    }
+    return true
+  }
+
+  if (!visitChildren(tree.children, 0) || ids.length === 0) {
+    return null
+  }
+  return ids
+}
+
+/**
+ * Resolve a complete logical order through PDF.js' shared marked-content IDs.
+ * Partial or malformed tagging returns null so the caller uses the geometric
+ * region/column fallback instead of mixing two uncertain orders.
+ */
+function resolveTaggedTextItemOrder(
+  contentItems: readonly unknown[],
+  structureTree: unknown,
+  selectedItems: readonly { str: string }[]
+): number[] | null {
+  const structureIds = collectStructContentIds(structureTree)
+  if (!structureIds) {
+    return null
+  }
+
+  const structureIdSet = new Set(structureIds)
+  const selectedIndex = new Map<object, number>()
+  selectedItems.forEach((item, index) => selectedIndex.set(item, index))
+  const indicesById = new Map<string, number[]>()
+  const markedContentStack: Array<string | null> = []
+  let sawMarkedContent = false
+
+  for (const rawItem of contentItems) {
+    if (isTextContentItem(rawItem)) {
+      const index = selectedIndex.get(rawItem)
+      if (index === undefined || !rawItem.str.trim()) {
+        continue
+      }
+      // The innermost structure-backed scope owns this text. If an inner
+      // marked scope is untagged, an enclosing mapped scope remains usable.
+      for (let i = markedContentStack.length - 1; i >= 0; i--) {
+        const id = markedContentStack[i]
+        if (id && structureIdSet.has(id)) {
+          const indices = indicesById.get(id) ?? []
+          indices.push(index)
+          indicesById.set(id, indices)
+          break
+        }
+      }
+      continue
+    }
+
+    if (!isObjectRecord(rawItem) || typeof rawItem.type !== 'string') {
+      continue
+    }
+    if (rawItem.type === 'beginMarkedContent' || rawItem.type === 'beginMarkedContentProps') {
+      sawMarkedContent = true
+      if (rawItem.type === 'beginMarkedContentProps' && typeof rawItem.id !== 'string') {
+        return null
+      }
+      markedContentStack.push(
+        rawItem.type === 'beginMarkedContentProps' ? rawItem.id as string : null
+      )
+    } else if (rawItem.type === 'endMarkedContent') {
+      sawMarkedContent = true
+      if (markedContentStack.length === 0) {
+        return null
+      }
+      markedContentStack.pop()
+    } else {
+      return null
+    }
+  }
+
+  if (!sawMarkedContent || markedContentStack.length > 0) {
+    return null
+  }
+
+  const required = selectedItems
+    .map((item, index) => item.str.trim() ? index : -1)
+    .filter((index) => index >= 0)
+  if (required.length === 0) {
+    return null
+  }
+
+  const order: number[] = []
+  const ordered = new Set<number>()
+  for (const id of structureIds) {
+    for (const index of indicesById.get(id) ?? []) {
+      if (!ordered.has(index)) {
+        ordered.add(index)
+        order.push(index)
+      }
+    }
+  }
+  return order.length === required.length && required.every((index) => ordered.has(index))
+    ? order
+    : null
+}
+
+/**
+ * Pure PDF.js tagged-order mapping for synthetic and real text-content data.
+ * The result indexes the text-only list in content-stream order; null means
+ * the tree, markers, or complete text-item mapping is unavailable/malformed.
+ */
+export function getTaggedTextItemOrder(
+  contentItems: readonly unknown[],
+  structureTree: unknown
+): number[] | null {
+  return resolveTaggedTextItemOrder(
+    contentItems,
+    structureTree,
+    contentItems.filter(isTextContentItem)
   )
 }
 
@@ -530,7 +719,7 @@ export async function inspectPdf(
     for (let i = 0; i < pageCount; i++) {
       const page = await doc.getPage(i + 1)
       try {
-        const textContent = await page.getTextContent()
+        const textContent = await page.getTextContent({ includeMarkedContent: true })
         const items = textContent.items.filter(isTextItem)
         const viewport = page.getViewport({ scale: 1.0 })
         const headerY = viewport.height * 0.92
@@ -542,6 +731,19 @@ export async function inspectPdf(
         const footerItems = items.filter((item) => item.transform[5] <= footerY)
         const bodyItems = items.filter((item) => item.transform[5] < headerY && item.transform[5] > footerY)
         const pageChars = bodyItems.reduce((acc, item) => acc + item.str.trim().length, 0)
+        let logicalBodyOrder: number[] | undefined
+        const hasMarkedContent = textContent.items.some((item) =>
+          isObjectRecord(item) &&
+          (item.type === 'beginMarkedContent' || item.type === 'beginMarkedContentProps' || item.type === 'endMarkedContent')
+        )
+        if (hasMarkedContent && typeof page.getStructTree === 'function') {
+          try {
+            const structureTree = await page.getStructTree()
+            logicalBodyOrder = resolveTaggedTextItemOrder(textContent.items, structureTree, bodyItems) ?? undefined
+          } catch {
+            /* PDFs sem árvore estrutural válida seguem pela geometria */
+          }
+        }
         // Os operadores têm de vir ANTES da deteção de bold: só depois de
         // getOperatorList() é que as fontes estão carregadas em
         // page.commonObjs (com nomes como "TimesNewRomanPS-BoldMT").
@@ -561,7 +763,7 @@ export async function inspectPdf(
         const boldFonts = collectBoldFontNames(page, items, styles)
         const headerLines = groupItemsIntoLines(headerItems, boldFonts)
         const footerLines = groupItemsIntoLines(footerItems, boldFonts)
-        const lines = groupItemsIntoLines(bodyItems, boldFonts)
+        const lines = groupItemsIntoLines(bodyItems, boldFonts, logicalBodyOrder)
         const { physicalPageNumber: headerPageNumber, title: headerTitle } = extractHeaderMetadata(headerLines)
         const { physicalPageNumber: footerPageNumber } = extractHeaderMetadata(footerLines)
         const physicalPageNumber = headerPageNumber ?? footerPageNumber
@@ -623,104 +825,439 @@ export async function inspectPdf(
 
 const LINE_Y_TOLERANCE = 4
 
-function groupItemsIntoLines(items: PdfTextItem[], boldFonts: Set<string> = new Set()): TextLine[] {
-  // Ordem de leitura natural: primeiro de cima para baixo (Y decrescente no
-  // sistema de coordenadas do PDF) e depois da esquerda para a direita (X
-  // crescente). Os itens de texto chegam do pdf.js pela ordem do content
-  // stream, que não corresponde à ordem visual — daí a ordenação espacial
-  // antes de qualquer agrupamento.
-  const positioned = items
-    .map((item) => ({
-      item,
-      x: item.transform[4],
-      y: item.transform[5],
-      fontSize: Math.hypot(item.transform[2], item.transform[3])
-    }))
-    .sort((a, b) => b.y - a.y || a.x - b.x)
+interface PositionedLayoutItem {
+  input: PdfTextLayoutItem
+  index: number
+  x: number
+  y: number
+  left: number
+  right: number
+  width: number
+  height: number
+  fontSize: number
+  direction: 'ltr' | 'rtl' | 'ttb'
+}
 
-  interface Group {
-    baseline: number
-    count: number
-    parts: typeof positioned
+interface BaselineBand {
+  baseline: number
+  items: PositionedLayoutItem[]
+}
+
+interface HorizontalGutter {
+  left: number
+  right: number
+  center: number
+}
+
+interface BuiltTextLine {
+  line: TextLine
+  logicalRank: number
+  sequence: number
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) {
+    return 0
   }
+  const sorted = [...values].sort((a, b) => a - b)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle]
+}
 
-  // Agrupa itens da mesma linha visual: um item entra no grupo quando está
-  // a <= LINE_Y_TOLERANCE do baseline médio do grupo (tolerância ~3-5px para
-  // elementos na mesma linha). O baseline médio absorve o drift gradual de
-  // y dentro da mesma linha sem partir a linha ao meio.
-  const groups: Group[] = []
-  for (const part of positioned) {
-    if (!part.item.str.trim()) {
-      continue
-    }
-    const current = groups[groups.length - 1]
-    if (current && current.baseline - part.y <= LINE_Y_TOLERANCE) {
-      current.baseline = (current.baseline * current.count + part.y) / (current.count + 1)
-      current.count += 1
-      current.parts.push(part)
-    } else {
-      groups.push({ baseline: part.y, count: 1, parts: [part] })
-    }
-  }
+function normalizeDirection(dir: string | undefined): PositionedLayoutItem['direction'] {
+  return dir === 'rtl' || dir === 'ttb' ? dir : 'ltr'
+}
 
-  const lines: TextLine[] = []
-  for (const group of groups) {
-    const parts = [...group.parts].sort((a, b) => a.x - b.x)
-    // Análise de estilo ANTES de qualquer concatenação: a flag de negrito de
-    // cada item (via fontName) é calculada isoladamente, para não ser
-    // contaminada pelo texto já unido da linha.
-    const itemStyles = parts.map((part) => ({
-      bold: part.item.fontName != null && boldFonts.has(part.item.fontName),
-      charCount: part.item.str.trim().length
-    }))
-    let text = ''
-    let prevEndX: number | null = null
-    let fontSize = 0
-    let minX = Infinity
-    let maxX = -Infinity
-    let boldChars = 0
-    let totalChars = 0
-
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i]
-      const str = part.item.str
-      if (itemStyles[i].bold) {
-        boldChars += itemStyles[i].charCount
-      }
-      totalChars += itemStyles[i].charCount
-      if (!text) {
-        text = str
-      } else {
-        const gap = part.x - (prevEndX ?? part.x)
-        const needsSpace = gap > Math.max(1, part.fontSize * 0.18) && !/\s$/.test(text) && !/^\s/.test(str)
-        text += (needsSpace ? ' ' : '') + str
-      }
-      prevEndX = part.x + (part.item.width ?? 0)
-      fontSize = Math.max(fontSize, part.fontSize)
-      minX = Math.min(minX, part.x)
-      maxX = Math.max(maxX, prevEndX)
+function prepareLayoutItems(items: readonly PdfTextLayoutItem[]): PositionedLayoutItem[] {
+  const positioned: PositionedLayoutItem[] = []
+  items.forEach((input, index) => {
+    if (
+      typeof input.str !== 'string' ||
+      !input.str.trim() ||
+      !Number.isFinite(input.x) ||
+      !Number.isFinite(input.y)
+    ) {
+      return
     }
-
-    const cleaned = text.replace(/\s+/g, ' ').trim()
-    if (!cleaned) {
-      continue
-    }
-    // A linha é "bold" quando a maioria dos caracteres visíveis usa fonte
-    // negrito (subtítulos destacados em peso, não apenas tamanho).
-    const bold = totalChars > 0 && boldChars / totalChars >= 0.6
-    lines.push({
-      text: cleaned,
-      x: minX,
-      y: group.baseline,
-      fontSize: Number(fontSize.toFixed(1)),
-      width: Math.max(0, maxX - minX),
-      ...(bold ? { bold: true } : {})
+    const height = Number.isFinite(input.height) ? Math.abs(input.height as number) : 0
+    const fontSize = Number.isFinite(input.fontSize) && input.fontSize > 0
+      ? input.fontSize
+      : height || 10
+    const suppliedWidth = Number.isFinite(input.width) ? Math.abs(input.width as number) : 0
+    // Width/height are supplied by PDF.js in ordinary text items; the estimate
+    // is only a conservative fallback for synthetic or incomplete inputs.
+    const width = suppliedWidth || Math.max(fontSize * 0.45, Array.from(input.str).length * fontSize * 0.5)
+    positioned.push({
+      input,
+      index,
+      x: input.x,
+      y: input.y,
+      left: input.x,
+      right: input.x + width,
+      width,
+      height: height || fontSize,
+      fontSize,
+      direction: normalizeDirection(input.dir)
     })
+  })
+  return positioned
+}
+
+function baselineTolerance(a: PositionedLayoutItem, b: PositionedLayoutItem): number {
+  // The 4-unit ceiling matches the former grouping tolerance; font dimensions
+  // make it tighter for small text and absorb ordinary baseline drift.
+  return Math.min(LINE_Y_TOLERANCE, Math.max(1.5, Math.min(a.height, b.height) * 0.32))
+}
+
+function makeBaselineBands(items: readonly PositionedLayoutItem[]): BaselineBand[] {
+  const sorted = [...items].sort((a, b) => b.y - a.y || a.x - b.x)
+  const bands: BaselineBand[] = []
+  for (const item of sorted) {
+    const current = bands[bands.length - 1]
+    if (current && Math.abs(current.baseline - item.y) <= baselineTolerance(current.items[0], item)) {
+      current.baseline = (current.baseline * current.items.length + item.y) / (current.items.length + 1)
+      current.items.push(item)
+    } else {
+      bands.push({ baseline: item.y, items: [item] })
+    }
+  }
+  return bands
+}
+
+function dominantDirection(items: readonly PositionedLayoutItem[]): PositionedLayoutItem['direction'] {
+  let ltrWeight = 0
+  let rtlWeight = 0
+  let ttbWeight = 0
+  for (const item of items) {
+    const weight = item.input.str.trim().length
+    if (item.direction === 'rtl') {
+      rtlWeight += weight
+    } else if (item.direction === 'ttb') {
+      ttbWeight += weight
+    } else {
+      ltrWeight += weight
+    }
+  }
+  if (ttbWeight > ltrWeight && ttbWeight > rtlWeight) {
+    return 'ttb'
+  }
+  return rtlWeight > ltrWeight ? 'rtl' : 'ltr'
+}
+
+function validGutter(
+  gutter: HorizontalGutter,
+  ordinaryItems: readonly PositionedLayoutItem[],
+  pageSpan: number,
+  typicalFontSize: number
+): boolean {
+  const leftItems = ordinaryItems.filter((item) => item.right <= gutter.left + 0.5)
+  const rightItems = ordinaryItems.filter((item) => item.left >= gutter.right - 0.5)
+  // Three independent baselines on each side plus overlapping vertical spans
+  // reject paragraph gaps, indents, and isolated side notes as columns.
+  if (leftItems.length < 3 || rightItems.length < 3) {
+    return false
+  }
+  const leftBands = makeBaselineBands(leftItems)
+  const rightBands = makeBaselineBands(rightItems)
+  if (leftBands.length < 3 || rightBands.length < 3) {
+    return false
   }
 
-  // As linhas já saem em ordem de leitura pela construção; a ordenação final
-  // é uma salvaguarda contra desempates instáveis do agrupamento.
-  return lines.sort((a, b) => b.y - a.y || a.x - b.x)
+  const leftMinY = leftItems.reduce((min, item) => Math.min(min, item.y), Infinity)
+  const leftMaxY = leftItems.reduce((max, item) => Math.max(max, item.y), -Infinity)
+  const rightMinY = rightItems.reduce((min, item) => Math.min(min, item.y), Infinity)
+  const rightMaxY = rightItems.reduce((max, item) => Math.max(max, item.y), -Infinity)
+  const leftSpan = leftMaxY - leftMinY
+  const rightSpan = rightMaxY - rightMinY
+  const minimumSpan = Math.max(typicalFontSize * 1.5, pageSpan * 0.22)
+  if (leftSpan < minimumSpan || rightSpan < minimumSpan) {
+    return false
+  }
+  const overlap = Math.min(leftMaxY, rightMaxY) - Math.max(leftMinY, rightMinY)
+  return overlap >= Math.max(typicalFontSize * 1.25, Math.min(leftSpan, rightSpan) * 0.3)
+}
+
+function detectHorizontalGutters(items: readonly PositionedLayoutItem[]): HorizontalGutter[] {
+  // A split is considered only for a wide, persistent blank projection. The
+  // width and support thresholds intentionally prefer a missed split over an
+  // arbitrary split of a normal one-column paragraph.
+  if (items.length < 6) {
+    return []
+  }
+  const contentLeft = items.reduce((min, item) => Math.min(min, item.left), Infinity)
+  const contentRight = items.reduce((max, item) => Math.max(max, item.right), -Infinity)
+  const contentWidth = contentRight - contentLeft
+  if (!(contentWidth > 0)) {
+    return []
+  }
+
+  const typicalFontSize = median(items.map((item) => item.fontSize)) || 10
+  const typicalWidth = median(items.map((item) => item.width)) || typicalFontSize
+  // Items at least 62% of the content span and 1.65x a typical item are
+  // treated as possible full-width headings, not evidence for a column edge.
+  const wideItemThreshold = Math.max(contentWidth * 0.62, typicalWidth * 1.65, typicalFontSize * 8)
+  const ordinaryItems = items.filter((item) => item.width < wideItemThreshold)
+  if (ordinaryItems.length < 6) {
+    return []
+  }
+
+  const intervals = [...ordinaryItems].sort((a, b) => a.left - b.left || a.right - b.right)
+  const mergeDistance = Math.max(4, typicalFontSize * 0.65)
+  // A gutter must be at least 18 PDF units, 1.8 font sizes, or 2.5% of the
+  // content width; then validGutter requires three baselines and vertical overlap.
+  const minimumGap = Math.max(18, typicalFontSize * 1.8, contentWidth * 0.025)
+  const projectedGaps: HorizontalGutter[] = []
+  let runRight = intervals[0].right
+  for (let i = 1; i < intervals.length; i++) {
+    const interval = intervals[i]
+    const gapWidth = interval.left - runRight
+    if (gapWidth > mergeDistance) {
+      if (gapWidth >= minimumGap) {
+        projectedGaps.push({ left: runRight, right: interval.left, center: (runRight + interval.left) / 2 })
+      }
+      runRight = interval.right
+    } else {
+      runRight = Math.max(runRight, interval.right)
+    }
+  }
+
+  const minY = ordinaryItems.reduce((min, item) => Math.min(min, item.y), Infinity)
+  const maxY = ordinaryItems.reduce((max, item) => Math.max(max, item.y), -Infinity)
+  const pageSpan = maxY - minY
+  return projectedGaps.filter((gutter) =>
+    validGutter(gutter, ordinaryItems, pageSpan, typicalFontSize)
+  )
+}
+
+function logicalRanksForItems(
+  items: readonly PositionedLayoutItem[],
+  logicalOrder: readonly number[] | undefined
+): Map<number, number> | null {
+  if (!logicalOrder || logicalOrder.length !== items.length) {
+    return null
+  }
+  const validIndexes = new Set(items.map((item) => item.index))
+  const ranks = new Map<number, number>()
+  logicalOrder.forEach((index, rank) => {
+    if (!validIndexes.has(index) || ranks.has(index)) {
+      ranks.clear()
+      return
+    }
+    ranks.set(index, rank)
+  })
+  return ranks.size === items.length ? ranks : null
+}
+
+function buildLineFromParts(parts: readonly PositionedLayoutItem[]): TextLine | null {
+  if (parts.length === 0) {
+    return null
+  }
+  let text = ''
+  let previous: PositionedLayoutItem | null = null
+  let fontSize = 0
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+  let boldChars = 0
+  let totalChars = 0
+
+  for (const part of parts) {
+    const str = part.input.str
+    const charCount = str.trim().length
+    if (part.input.bold) {
+      boldChars += charCount
+    }
+    totalChars += charCount
+    if (text) {
+      const centerGap = Math.abs((part.left + part.right) / 2 - ((previous?.left ?? 0) + (previous?.right ?? 0)) / 2)
+        - (part.width + (previous?.width ?? 0)) / 2
+      const needsSpace = centerGap > Math.max(1, part.fontSize * 0.18) && !/\s$/.test(text) && !/^\s/.test(str)
+      text += (needsSpace ? ' ' : '') + str
+    } else {
+      text = str
+    }
+    previous = part
+    fontSize = Math.max(fontSize, part.fontSize)
+    minX = Math.min(minX, part.left)
+    maxX = Math.max(maxX, part.right)
+    minY = Math.min(minY, part.y)
+    maxY = Math.max(maxY, part.y)
+  }
+
+  const cleaned = text.replace(/\s+/g, ' ').trim()
+  if (!cleaned) {
+    return null
+  }
+  const bold = totalChars > 0 && boldChars / totalChars >= 0.6
+  return {
+    text: cleaned,
+    x: minX,
+    y: (minY + maxY) / 2,
+    fontSize: Number(fontSize.toFixed(1)),
+    width: Math.max(0, maxX - minX),
+    ...(bold ? { bold: true } : {})
+  }
+}
+
+function buildLinesFromBand(
+  items: readonly PositionedLayoutItem[],
+  logicalRanks: Map<number, number> | null,
+  firstSequence: number
+): BuiltTextLine[] {
+  if (items.length === 0) {
+    return []
+  }
+  const direction = dominantDirection(items)
+  const ordered = [...items].sort((a, b) => {
+    if (logicalRanks) {
+      return (logicalRanks.get(a.index) ?? Infinity) - (logicalRanks.get(b.index) ?? Infinity)
+    }
+    return direction === 'ltr' ? a.left - b.left || b.y - a.y : b.right - a.right || b.y - a.y
+  })
+
+  const chunks: PositionedLayoutItem[][] = []
+  let current: PositionedLayoutItem[] = []
+  for (const item of ordered) {
+    // PDF.js hasEOL is a line terminator only; it never starts a paragraph.
+    if (current.length > 0 && current[current.length - 1].input.hasEOL === true) {
+      chunks.push(current)
+      current = []
+    }
+    current.push(item)
+  }
+  if (current.length > 0) {
+    chunks.push(current)
+  }
+
+  const lines: BuiltTextLine[] = []
+  chunks.forEach((parts, index) => {
+    const line = buildLineFromParts(parts)
+    if (!line) {
+      return
+    }
+    const logicalRank = logicalRanks
+      ? parts.reduce((rank, part) => Math.min(rank, logicalRanks.get(part.index) ?? Infinity), Infinity)
+      : Infinity
+    lines.push({ line, logicalRank, sequence: firstSequence + index })
+  })
+  return lines
+}
+
+/**
+ * Pure spatial text layout, exported so column/line ordering can be exercised
+ * with synthetic PDF.js-like items. A complete tagged permutation wins; if
+ * absent, geometry uses top-to-bottom bands and column-wise reading order.
+ */
+export function layoutPdfTextItems(
+  items: readonly PdfTextLayoutItem[],
+  options: PdfTextLayoutOptions = {}
+): TextLine[] {
+  const positioned = prepareLayoutItems(items)
+  if (positioned.length === 0) {
+    return []
+  }
+  const logicalRanks = logicalRanksForItems(positioned, options.logicalOrder)
+  const gutters = detectHorizontalGutters(positioned)
+  const pageDirection = dominantDirection(positioned)
+  const bands = makeBaselineBands(positioned)
+  const builtLines: BuiltTextLine[] = []
+  let sequence = 0
+  let pendingBands: BaselineBand[] = []
+
+  const appendItems = (bandItems: readonly PositionedLayoutItem[]): void => {
+    const lines = buildLinesFromBand(bandItems, logicalRanks, sequence)
+    builtLines.push(...lines)
+    sequence += lines.length
+  }
+
+  const appendBand = (band: BaselineBand, regionIndex?: number): void => {
+    const bandItems = regionIndex === undefined
+      ? band.items
+      : band.items.filter((item) => {
+          let itemRegion = 0
+          for (const gutter of gutters) {
+            if (item.left < gutter.center && item.right > gutter.center) {
+              return false
+            }
+            if ((item.left + item.right) / 2 >= gutter.center) {
+              itemRegion++
+            }
+          }
+          return itemRegion === regionIndex
+        })
+    appendItems(bandItems)
+  }
+
+  const flushPendingBands = (): void => {
+    if (pendingBands.length === 0) {
+      return
+    }
+    const regionCount = gutters.length + 1
+    const regionOrder = Array.from({ length: regionCount }, (_, index) => index)
+    if (pageDirection !== 'ltr') {
+      regionOrder.reverse()
+    }
+    // Once a page has a supported gutter, finish each region top-to-bottom
+    // before moving horizontally to the next; this avoids row-wise columns.
+    for (const regionIndex of regionOrder) {
+      for (const band of pendingBands) {
+        appendBand(band, regionIndex)
+      }
+    }
+    pendingBands = []
+  }
+
+  for (const band of bands) {
+    const spanningItems = band.items.filter((item) =>
+      gutters.some((gutter) => item.left < gutter.center && item.right > gutter.center)
+    )
+    if (spanningItems.length > 0) {
+      // Full-width text is a visual separator between column regions.
+      flushPendingBands()
+      appendItems(spanningItems)
+      const sameBaselineColumnItems = band.items.filter((item) => !spanningItems.includes(item))
+      if (sameBaselineColumnItems.length > 0) {
+        const regionOrder = Array.from({ length: gutters.length + 1 }, (_, index) => index)
+        if (pageDirection !== 'ltr') {
+          regionOrder.reverse()
+        }
+        const remainderBand = { baseline: band.baseline, items: sameBaselineColumnItems }
+        for (const regionIndex of regionOrder) {
+          appendBand(remainderBand, regionIndex)
+        }
+      }
+    } else {
+      pendingBands.push(band)
+    }
+  }
+  flushPendingBands()
+
+  if (logicalRanks) {
+    builtLines.sort((a, b) => a.logicalRank - b.logicalRank || a.sequence - b.sequence)
+  }
+  return builtLines.map(({ line }) => line)
+}
+
+function groupItemsIntoLines(
+  items: PdfTextItem[],
+  boldFonts: Set<string> = new Set(),
+  logicalOrder?: readonly number[]
+): TextLine[] {
+  const layoutItems = items.map((item): PdfTextLayoutItem => ({
+    str: item.str,
+    x: item.transform[4],
+    y: item.transform[5],
+    fontSize: Math.hypot(item.transform[2], item.transform[3]),
+    width: item.width,
+    height: item.height,
+    dir: item.dir,
+    hasEOL: item.hasEOL,
+    bold: item.fontName != null && boldFonts.has(item.fontName)
+  }))
+  return layoutPdfTextItems(layoutItems, { logicalOrder })
 }
 
 /** Imagem decodificada como a entrega o pdf.js (display-ready). */
