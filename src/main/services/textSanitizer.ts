@@ -1,4 +1,4 @@
-import type { PdfOutlineEntry, PdfPageContent, TextLine } from './pdfInspector'
+import { extractHeaderMetadata, type PdfOutlineEntry, type PdfPageContent, type TextLine } from './pdfInspector'
 
 export type ParagraphKind = 'text' | 'subheading'
 
@@ -11,6 +11,8 @@ export interface SanitizedParagraph {
   atPageTop?: boolean
   /** o parágrafo é precedido de um espaçamento vertical significativo */
   afterBigGap?: boolean
+  /** a primeira linha tem o recuo típico de início de parágrafo */
+  firstLineIndented?: boolean
   /** subtítulo/intertítulo no meio do texto (renderizado como h2/h3) */
   kind?: ParagraphKind
   /** nível do subtítulo: 2 = h2 (destaque por tamanho), 3 = h3 (destaque apenas em peso) */
@@ -27,8 +29,6 @@ export interface SanitizedPageMetadata {
   pageIndex: number
   physicalPageNumber?: string
   headerTitle?: string
-  /** cabeçalho não vazio diferente do último cabeçalho identificado */
-  headerChanged?: boolean
 }
 
 export interface DetectedChapter {
@@ -111,14 +111,15 @@ function dominantBodyFontSize(lines: TextLine[]): number {
 /**
  * Uma linha funciona como subtítulo quando cumpre TODOS os critérios:
  * tipografia de destaque (tamanho >= 1.15× o corpo da página OU fonte
- * Bold/Black/Heavy/Medium) + linha curta, maioritariamente letras e sem
- * pontuação terminal de frase corrida. A posição vertical (espaçamentos) NÃO
- * é exigida: um subtítulo a negrito no meio de um parágrafo corrido mantém-se
- * subtítulo, na sua ordem natural de leitura, em vez de ser rebaixado a <p>.
- * Linhas OCR (sem métricas) nunca são subtítulos.
+ * Bold/Black/Heavy/Medium) + linha curta, maioritariamente letras, sem
+ * pontuação terminal e visualmente separada do texto corrido. O isolamento
+ * evita partir um parágrafo só porque uma das suas linhas está a negrito.
  */
-function isSubheadingLine(line: TextLine, metrics: PageLineMetrics): boolean {
+function isSubheadingLine(line: TextLine, metrics: PageLineMetrics, visuallySeparated: boolean): boolean {
   if (metrics.bodyFontSize <= 0 || !(line.fontSize > 0)) {
+    return false
+  }
+  if (!visuallySeparated) {
     return false
   }
   const text = line.text.trim()
@@ -197,6 +198,9 @@ function stripPageFurniture(lines: TextLine[], repeatedHeaders: Set<string>): Te
  * espaçamento antes do bloco continue a ser medido corretamente.
  */
 function dehyphenateLines(lines: TextLine[]): TextLine[] {
+  const fontSize = dominantBodyFontSize(lines)
+  const normalGap = typicalLineGap(lines, fontSize)
+  const maxLineBreak = Math.max(normalGap * 1.6, fontSize * 2.2, 18)
   const out: TextLine[] = []
   for (const line of lines) {
     const text = line.text.replace(/\u00AD/g, '')
@@ -204,7 +208,16 @@ function dehyphenateLines(lines: TextLine[]): TextLine[] {
     if (prev) {
       const prevTrim = prev.text.trimEnd()
       const next = text.trim()
-      if (prevTrim.endsWith('-') && next) {
+      const fontSize = Math.max(prev.fontSize, line.fontSize)
+      const verticalGap = prev.y - line.y
+      const nextStartsIndented =
+        line.x - prev.x >= Math.max(fontSize * 0.65, 5) &&
+        line.x - prev.x <= Math.max(fontSize * 3, 24)
+      const sameTextBlock =
+        verticalGap > 0 &&
+        verticalGap <= maxLineBreak &&
+        !nextStartsIndented
+      if (prevTrim.endsWith('-') && next && sameTextBlock) {
         if (/^[a-z\u00E0-\u00FF]/.test(next)) {
           prev.text = prevTrim.slice(0, -1) + next
         } else {
@@ -240,8 +253,8 @@ function pageSourceLines(page: PdfPageContent): TextLine[] {
   if (typeof page.text === 'string' && !page.text.trim()) {
     return []
   }
-  const structured = (page.lines ?? []).filter((line) => line.text.trim())
-  if (structured.length > 0) {
+  const structured = page.lines ?? []
+  if (structured.some((line) => line.text.trim())) {
     return structured
   }
   if (typeof page.text === 'string' && page.text.trim()) {
@@ -250,11 +263,58 @@ function pageSourceLines(page: PdfPageContent): TextLine[] {
   return []
 }
 
-// Espaço vertical (em pt) a partir do qual se considera "espaçamento
-// significativo" antes de um título de capítulo: nunca menos que 14pt
-// (linha em branco larga) nem menos que ~2.2× o corpo da linha anterior.
-const LINE_GAP_FACTOR = 2.2
-const MIN_LINE_GAP = 14
+interface SegmentedPage {
+  lines: TextLine[]
+  geometryAware: boolean
+  metadata: SanitizedPageMetadata
+}
+
+/** Aplica as mesmas zonas aos textos OCR com coordenadas e aos textos pdf.js. */
+function segmentPage(page: PdfPageContent, pageIndex: number): SegmentedPage {
+  const sourceLines = pageSourceLines(page)
+  const geometryAware = (page.lines?.length ?? 0) > 0 && (page.height ?? 0) > 0
+  if (!geometryAware) {
+    return {
+      lines: sourceLines,
+      geometryAware: false,
+      metadata: {
+        pageIndex,
+        ...(page.physicalPageNumber ? { physicalPageNumber: page.physicalPageNumber } : {}),
+        ...(page.headerTitle ? { headerTitle: page.headerTitle } : {})
+      }
+    }
+  }
+
+  const height = page.height!
+  const headerLines = page.lines!.filter((line) => line.text.trim() && line.y >= height * 0.92)
+  const footerLines = page.lines!.filter((line) => line.text.trim() && line.y <= height * 0.06)
+  const bodyLines = sourceLines.length === 0
+    ? []
+    : page.lines!.filter((line) => line.y < height * 0.92 && line.y > height * 0.06)
+  const header = extractHeaderMetadata(headerLines)
+  const footer = extractHeaderMetadata(footerLines)
+
+  return {
+    lines: bodyLines,
+    geometryAware: true,
+    metadata: {
+      pageIndex,
+      ...(page.physicalPageNumber ?? header.physicalPageNumber ?? footer.physicalPageNumber
+        ? { physicalPageNumber: page.physicalPageNumber ?? header.physicalPageNumber ?? footer.physicalPageNumber }
+        : {}),
+      ...(page.headerTitle ?? (header.title || undefined)
+        ? { headerTitle: page.headerTitle ?? header.title }
+        : {})
+    }
+  }
+}
+
+// Um salto entre linhas só é quebra de parágrafo se exceder claramente a
+// entrelinha normal da página. A pontuação terminal, por si só, não separa
+// frases que pertencem ao mesmo parágrafo.
+const PARAGRAPH_GAP_FACTOR = 1.3
+const PARAGRAPH_FONT_GAP_FACTOR = 1.45
+const MIN_PARAGRAPH_GAP = 5
 
 interface PageParagraph {
   text: string
@@ -262,6 +322,8 @@ interface PageParagraph {
   atPageTop: boolean
   /** precedido de grande espaçamento vertical */
   afterBigGap: boolean
+  /** primeira linha alinhada com recuo de parágrafo */
+  firstLineIndented: boolean
   /** índice da primeira linha do bloco */
   firstLineIndex: number
   /** subtítulo tipográfico vs parágrafo normal */
@@ -270,13 +332,83 @@ interface PageParagraph {
   level: 2 | 3
 }
 
+function percentile(values: number[], fraction: number): number {
+  if (values.length === 0) {
+    return 0
+  }
+  const sorted = [...values].sort((a, b) => a - b)
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * fraction)))
+  return sorted[index]
+}
+
+function typicalLineGap(lines: TextLine[], bodyFontSize: number): number {
+  const positioned = lines
+    .filter((line) => line.text.trim())
+    .sort((a, b) => b.y - a.y)
+  const gaps: number[] = []
+  for (let i = 1; i < positioned.length; i++) {
+    const gap = positioned[i - 1].y - positioned[i].y
+    const fontSize = Math.max(positioned[i - 1].fontSize, positioned[i].fontSize, bodyFontSize)
+    if (gap > 0 && gap <= Math.max(fontSize * 2.5, 30)) {
+      gaps.push(gap)
+    }
+  }
+  // O quartil inferior aproxima a entrelinha, mesmo que haja alguns saltos
+  // de parágrafo no conjunto de linhas da página.
+  return percentile(gaps, 0.25)
+}
+
+function commonBodyLeft(lines: TextLine[]): number {
+  const weights = new Map<number, number>()
+  for (const line of lines) {
+    if (!line.text.trim()) {
+      continue
+    }
+    const bucket = Math.round(line.x / 2) * 2
+    weights.set(bucket, (weights.get(bucket) ?? 0) + Math.min(line.text.length, 120))
+  }
+  let left = 0
+  let bestWeight = 0
+  for (const [x, weight] of weights) {
+    if (weight > bestWeight) {
+      left = x
+      bestWeight = weight
+    }
+  }
+  return left
+}
+
+function isIndentedLine(line: TextLine, bodyLeft: number, bodyFontSize: number): boolean {
+  const indent = line.x - bodyLeft
+  const fontSize = line.fontSize || bodyFontSize
+  return indent >= Math.max(fontSize * 0.65, 5) && indent <= Math.max(fontSize * 3, 24)
+}
+
 function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize = 0): PageParagraph[] {
   const firstContentIndex = lines.findIndex((line) => line.text.trim())
   const metrics = computeLineMetrics(lines, bodyFontSize)
+  const lineGap = typicalLineGap(lines, metrics.bodyFontSize)
+  const bodyLeft = commonBodyLeft(lines)
   // Nível do subtítulo: 2 quando o destaque vem do tamanho (h2), 3 quando
   // vem apenas do peso da fonte (h3). `false` = não é subtítulo.
-  const subheadingAt = lines.map((line): false | 2 | 3 => {
-    if (!isSubheadingLine(line, metrics)) {
+  const subheadingAt = lines.map((line, index): false | 2 | 3 => {
+    const prev = index > 0 ? lines[index - 1] : undefined
+    const next = index + 1 < lines.length ? lines[index + 1] : undefined
+    const gapThreshold = Math.max(
+      lineGap * PARAGRAPH_GAP_FACTOR,
+      line.fontSize * PARAGRAPH_FONT_GAP_FACTOR,
+      MIN_PARAGRAPH_GAP
+    )
+    const separatedAbove = !!prev && (
+      !prev.text.trim() || prev.y - line.y > gapThreshold
+    )
+    const separatedBelow = !!next && (
+      !next.text.trim() || line.y - next.y > gapThreshold
+    )
+    const prominentAtPageTop =
+      index === firstContentIndex &&
+      (line.bold === true || line.fontSize >= metrics.bodyFontSize * SUBHEADING_SIZE_FACTOR)
+    if (!isSubheadingLine(line, metrics, separatedAbove || separatedBelow || prominentAtPageTop)) {
       return false
     }
     return line.fontSize >= metrics.bodyFontSize * SUBHEADING_SIZE_FACTOR ? 2 : 3
@@ -288,6 +420,7 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
   let afterBigGap = false
   let blockKind: ParagraphKind = 'text'
   let blockLevel: 2 | 3 = 2
+  let previousLine: TextLine | null = null
 
   const flush = (): void => {
     const text = parts.join(' ').replace(/\s+/g, ' ').trim()
@@ -296,6 +429,7 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
         text,
         atPageTop: start === firstContentIndex,
         afterBigGap,
+        firstLineIndented: start >= 0 && isIndentedLine(lines[start], bodyLeft, metrics.bodyFontSize),
         firstLineIndex: start,
         kind: blockKind,
         level: blockLevel
@@ -306,6 +440,7 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
     afterBigGap = false
     blockKind = 'text'
     blockLevel = 2
+    previousLine = null
   }
 
   for (let i = 0; i < lines.length; i++) {
@@ -328,29 +463,25 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
       start = i
       blockKind = lineKind
       blockLevel = lineLevel === false ? 2 : lineLevel
-    } else if (i > 0) {
-      const prev = lines[i - 1]
-      const prevText = prev.text.trimEnd()
-      const nextText = raw.trim()
-      const prevEndsSentence = /[.:!?…]["»']?$/.test(prevText)
-      const nextStartsUpper = /^[A-ZÀ-ÖØ-Þ\u0100-\u017F]/.test(nextText)
-      const prevIsShortHeading = prevText.length < 30 && !/[.:!?…]$/.test(prevText)
+    } else if (previousLine) {
+      const fontSize = Math.max(previousLine.fontSize, line.fontSize, metrics.bodyFontSize)
+      const verticalGap = previousLine.y - line.y
       const bigGap =
-        prev.fontSize > 0 &&
-        line.fontSize > 0 &&
-        prev.y - line.y > Math.max(LINE_GAP_FACTOR * prev.fontSize, MIN_LINE_GAP)
+        verticalGap > Math.max(
+          lineGap * PARAGRAPH_GAP_FACTOR,
+          fontSize * PARAGRAPH_FONT_GAP_FACTOR,
+          MIN_PARAGRAPH_GAP
+        )
+      const startsIndentedParagraph = isIndentedLine(line, bodyLeft, fontSize)
 
-      if (bigGap) {
+      if (bigGap || startsIndentedParagraph) {
         flush()
-        afterBigGap = true
-      } else if (prevEndsSentence && nextStartsUpper) {
-        flush()
-      } else if (prevIsShortHeading) {
-        flush()
+        afterBigGap = bigGap
       }
     }
 
     parts.push(raw.trim())
+    previousLine = line
   }
   flush()
 
@@ -378,27 +509,20 @@ function buildPageParagraphs(lines: TextLine[], pageHeight: number, bodyFontSize
 }
 
 export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
-  const pageLineSets = pages.map((page) => stripPageNumberLines(pageSourceLines(page)))
-  let previousHeaderTitle = ''
-  const pageMetadata: SanitizedPageMetadata[] = pages.map((page, pageIndex) => {
-    const headerTitle = page.headerTitle?.replace(/\s+/g, ' ').trim() ?? ''
-    const headerChanged =
-      !!headerTitle &&
-      !!previousHeaderTitle &&
-      headerTitle.toLowerCase() !== previousHeaderTitle.toLowerCase()
-    if (headerTitle) {
-      previousHeaderTitle = headerTitle
-    }
-    return {
-      pageIndex,
-      ...(page.physicalPageNumber ? { physicalPageNumber: page.physicalPageNumber } : {}),
-      ...(headerTitle ? { headerTitle } : {}),
-      ...(headerChanged ? { headerChanged: true } : {})
-    }
-  })
+  const segmentedPages = pages.map((page, pageIndex) => segmentPage(page, pageIndex))
+  const pageLineSets = segmentedPages.map((page) =>
+    page.geometryAware ? page.lines : stripPageNumberLines(page.lines)
+  )
+  const pageMetadata = segmentedPages.map((page) => page.metadata)
 
   const headerCounts = new Map<string, number>()
-  for (const lines of pageLineSets) {
+  let unstructuredPageCount = 0
+  for (let i = 0; i < pageLineSets.length; i++) {
+    if (segmentedPages[i].geometryAware) {
+      continue
+    }
+    unstructuredPageCount++
+    const lines = pageLineSets[i]
     const first = lines.find((line) => line.text.trim())
     if (!first) {
       continue
@@ -409,20 +533,23 @@ export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
 
   const repeatedHeaders = new Set(
     [...headerCounts.entries()]
-      .filter(([, count]) => count >= 2 && count / Math.max(1, pages.length) >= 0.5)
+      .filter(([, count]) => count >= 2 && count / Math.max(1, unstructuredPageCount) >= 0.5)
       .map(([key]) => key)
   )
 
   // Separação em parágrafos com posição: cada página produz blocos com a
   // informação de posição vertical (topo da página / grande espaçamento).
   const paragraphsPerPage = pageLineSets.map((lines, pageIndex) => {
-    const withoutFurniture = stripPageFurniture(lines, repeatedHeaders)
+    const withoutFurniture = segmentedPages[pageIndex].geometryAware
+      ? lines
+      : stripPageFurniture(lines, repeatedHeaders)
     const dehyphenated = dehyphenateLines(withoutFurniture)
     return buildPageParagraphs(dehyphenated, pages[pageIndex]?.height ?? 0, pages[pageIndex]?.bodyFontSize ?? 0)
   })
 
-  // Junção de fragmentos de parágrafo entre páginas: um parágrafo que não
-  // termina com pontuação de frase continua na página seguinte.
+  // Junção de parágrafos partidos pela viragem de página. Uma frase pode
+  // terminar sem que o parágrafo tenha terminado; o recuo da página seguinte
+  // distingue um novo parágrafo de uma continuação flush-left.
   const paragraphs: SanitizedParagraph[] = []
   let open: SanitizedParagraph | null = null
 
@@ -434,16 +561,17 @@ export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
       if (!open) {
         open = toSanitized(para, pageIndex)
       } else {
-        // Só junta uma continuação genuína a meio de frase: o parágrafo
-        // anterior não tem pontuação terminal E o fragmento seguinte começa
-        // com minúscula. Nunca absorve títulos (marcadores de capítulo) nem
-        // subtítulos tipográficos.
+        // Uma página pode começar com recuo mesmo quando a frase foi cortada
+        // pela margem inferior da anterior. Nesse caso, a falta de pontuação
+        // final confirma a continuação; sem recuo, o parágrafo também pode
+        // continuar depois de uma frase completa.
         const continuesMidSentence =
           open.kind !== 'subheading' &&
           para.kind !== 'subheading' &&
           pageIndex > open.startPage &&
           para.atPageTop &&
-          !SENTENCE_END_RE.test(open.text) &&
+          (!para.firstLineIndented || !SENTENCE_END_RE.test(open.text)) &&
+          !isChapterMarker(open.text) &&
           !isChapterMarker(para.text)
         if (continuesMidSentence) {
           open = { ...open, text: joinParagraphFragments(open.text, para.text) }
@@ -467,12 +595,11 @@ function toSanitized(para: PageParagraph, pageIndex: number): SanitizedParagraph
     startPage: pageIndex,
     atPageTop: para.atPageTop,
     afterBigGap: para.afterBigGap,
+    firstLineIndented: para.firstLineIndented,
     kind: para.kind,
     level: para.level
   }
 }
-
-const SENTENCE_END_RE = /[.!?…»"'”’)\]]$/
 
 function joinParagraphFragments(prev: string, next: string): string {
   if (prev.endsWith('-')) {
@@ -484,6 +611,7 @@ function joinParagraphFragments(prev: string, next: string): string {
 }
 
 const CHAPTER_TITLE_MAX_LENGTH = 70
+const SENTENCE_END_RE = /[.!?…]["»'”’)]?$/
 
 export function isChapterMarker(block: string): boolean {
   const text = block.replace(/\s+/g, ' ').trim()
@@ -495,8 +623,7 @@ export function isChapterMarker(block: string): boolean {
     return false
   }
 
-  // Títulos não terminam com pontuação terminal (frases e itens de lista
-  // terminam; títulos não).
+  // Títulos explícitos não terminam com pontuação terminal.
   if (/[.,;:]$/.test(text)) {
     return false
   }
@@ -508,20 +635,6 @@ export function isChapterMarker(block: string): boolean {
     return true
   }
   if (/^[IVXLCDM]{1,7}$/.test(text)) {
-    return true
-  }
-
-  const letters = text.replace(/[^a-zA-ZÀ-ÖØ-öø-ÿ]/g, '')
-  const nonSpaces = text.replace(/\s/g, '')
-  const isAllCaps = text === text.toUpperCase() && letters.length >= 4
-  const isMostlyLetters = letters.length / Math.max(1, nonSpaces.length) >= 0.7
-  if (
-    text.length >= 4 &&
-    isAllCaps &&
-    isMostlyLetters &&
-    !/\d/.test(text) &&
-    !/[!?…]$/.test(text)
-  ) {
     return true
   }
 
@@ -616,8 +729,32 @@ export function detectChapters(
       chosenIndex++
     }
     const chapterDepth = depths[chosenIndex]
-    chapterEntries = validOutline.filter((entry) => entry.depth <= chapterDepth)
+    // Os pais do nível escolhido são normalmente partes/categorias do índice,
+    // não capítulos. Promovê-los todos cria divisões que não correspondem a
+    // títulos impressos no corpo.
+    chapterEntries = validOutline.filter((entry) => entry.depth === chapterDepth)
   }
+
+  // Um bookmark só pode dividir o texto se o respetivo título estiver
+  // realmente impresso no início do conteúdo da página de destino. PDFs
+  // frequentemente trazem bookmarks desatualizados ou apontados a páginas
+  // erradas; nesse caso, o texto do corpo é a fonte de verdade.
+  chapterEntries = chapterEntries.filter((entry) => {
+    const titleKey = normalizeChapterEvidence(entry.title)
+    if (titleKey.length < 4) {
+      return false
+    }
+    const pageParagraphs = paragraphs
+      .filter((paragraph) => paragraph.startPage === entry.pageIndex)
+      .slice(0, 3)
+    for (let count = 1; count <= pageParagraphs.length; count++) {
+      const bodyKey = normalizeChapterEvidence(pageParagraphs.slice(0, count).map((paragraph) => paragraph.text).join(' '))
+      if (bodyKey === titleKey || (titleKey.length >= 10 && bodyKey.startsWith(titleKey))) {
+        return true
+      }
+    }
+    return false
+  })
   const hasNativeOutline = chapterEntries.length > 0
 
   const titleByPage = new Map<number, { title: string; source: 'outline' | 'mark' }>()
@@ -646,7 +783,6 @@ export function detectChapters(
 
   const chapters: WorkingChapter[] = []
   const lead: string[] = []
-  let pendingHeaderTitle = ''
   let pendingPageBreaks: string[] = []
   let current: WorkingChapter | null = null
   let sawChapterMarker = false
@@ -660,8 +796,13 @@ export function detectChapters(
     if (current) {
       chapters.push(current)
       current = null
-    } else if (lead.length) {
+    } else if (lead.some((part) => !/^@pagebreak:[^\s]+$/.test(part))) {
       chapters.push({ title: 'Introdução', parts: [...lead], startPage: 0, pinned: titleByPage.has(0) })
+      lead.length = 0
+    } else if (lead.length) {
+      // Marcadores anteriores ao primeiro título pertencem à abertura do
+      // primeiro capítulo; não devem criar um capítulo "Introdução" vazio.
+      pendingPageBreaks = [...lead, ...pendingPageBreaks]
       lead.length = 0
     }
   }
@@ -670,35 +811,39 @@ export function detectChapters(
   const ROMAN_NUMERAL_RE = /^[IVXLCDM]{1,7}$/
 
   /**
-   * Heurística textual (só sem outline nativo). Critérios cumulativos:
-   * marcador de capítulo + posição/quebra. Marcadores fortes ("Capítulo 3",
-   * "Parte II", numerais romanos isolados) valem no topo da página ou após
-   * grande espaçamento; títulos genéricos em maiúsculas exigem posição no
-   * topo da página. Um título genérico tipográfico (subtítulo em negrito)
-   * no topo da página continua a abrir capítulo; só os subtítulos no MEIO
-   * da secção ficam como h2/h3, sem quebrar capítulo.
+   * Um título tipográfico (negrito/maior) no topo da página abre capítulo.
+   * Sem esse sinal ou um outline validado, só se aceitam marcadores textuais
+   * explícitos, nunca nomes correntes ou linhas normais em maiúsculas.
    */
   const startsHeuristicChapter = (para: SanitizedParagraph): boolean => {
+    const styledPageTitle =
+      para.kind === 'subheading' &&
+      para.atPageTop === true &&
+      para.text.length <= CHAPTER_TITLE_MAX_LENGTH &&
+      !/[.!?…]$/.test(para.text)
+    if (styledPageTitle) {
+      return true
+    }
     if (hasNativeOutline || !isChapterMarker(para.text)) {
       return false
     }
+    // Sem bookmark validado, só divisões explícitas e inequívocas. A regra
+    // antiga que promovia qualquer bloco em MAIÚSCULAS no topo transformava
+    // cabeçalhos de página, nomes e títulos correntes em capítulos.
     if (STRONG_CHAPTER_RE.test(para.text) || ROMAN_NUMERAL_RE.test(para.text.trim())) {
       return para.atPageTop === true || para.afterBigGap === true
     }
-    return para.atPageTop === true
+    return false
   }
 
   for (const pageIndex of [...groupsByPage.keys(), ...(illustrations?.keys() ?? []), ...metadataByPage.keys()]
     .filter((value, index, self) => self.indexOf(value) === index)
     .sort((a, b) => a - b)) {
-    let pageParas = groupsByPage.get(pageIndex) ?? []
+    const pageParas = groupsByPage.get(pageIndex) ?? []
     const pageMeta = metadataByPage.get(pageIndex)
     const pageIllustrations = illustrations?.get(pageIndex) ?? []
     const hasPageContent = pageParas.length > 0 || pageIllustrations.length > 0
     const chapterHint = hasPageContent ? titleByPage.get(pageIndex) : undefined
-    if (pageMeta?.headerChanged && pageMeta.headerTitle) {
-      pendingHeaderTitle = pageMeta.headerTitle
-    }
 
     const pageBreaks = [...pendingPageBreaks]
     pendingPageBreaks = []
@@ -718,7 +863,6 @@ export function detectChapters(
     }
 
     if (chapterHint) {
-      pendingHeaderTitle = ''
       sawChapterMarker = true
       closeCurrent()
 
@@ -727,50 +871,26 @@ export function detectChapters(
 
       if (chapterHint.source === 'outline') {
         title = chapterHint.title
-        // Remove o bloco que duplica o título do bookmark (ex.: o texto
-        // "Capítulo 3" impresso no topo da página).
-        if (body.length > 0 && normalizeTitle(body[0]) === normalizeTitle(title)) {
-          body = body.slice(1)
-        }
       } else {
         // Marca do utilizador: escolhe um bloco com aspeto de título
         // (marcador de capítulo curto, maioritariamente letras, sem
         // dígitos) entre os primeiros; salta números de página, cabeçalhos
         // correntes como "172 EMILY HAUSER" e placeholders internos.
-        let titleIndex = -1
         for (let i = 0; i < Math.min(3, body.length); i++) {
           if (body[i].startsWith('@') || PAGE_NUMBER_RE.test(body[i])) {
             continue
           }
           if (isChapterMarker(body[i])) {
             title = body[i]
-            titleIndex = i
             break
           }
         }
-        if (titleIndex >= 0) {
-          body = body.filter((_, i) => i !== titleIndex)
-        }
       }
 
-      body = [...pageBreaks, ...body]
+      body = [...pendingPageBreaks, ...pageBreaks, ...body]
+      pendingPageBreaks = []
       current = { title, parts: body, startPage: pageIndex, pinned: true }
     } else {
-      let headerChapterTitle = ''
-      if (pendingHeaderTitle && pageParas.length > 0) {
-        headerChapterTitle = pendingHeaderTitle
-        pendingHeaderTitle = ''
-        closeCurrent()
-        current = { title: headerChapterTitle, parts: [], startPage: pageIndex, pinned: true }
-        sawChapterMarker = true
-
-        // Se o título impresso também aparece no corpo (caso não esteja
-        // totalmente dentro da zona geométrica), não o duplicamos.
-        if (normalizeTitle(pageParas[0].text) === normalizeTitle(headerChapterTitle)) {
-          pageParas = pageParas.slice(1)
-        }
-      }
-
       if (pageBreaks.length > 0) {
         if (current) {
           current.parts.push(...pageBreaks)
@@ -785,19 +905,24 @@ export function detectChapters(
           sawChapterMarker = true
           closeCurrent()
 
+          const styledPageTitle = para.kind === 'subheading' && para.atPageTop === true
           let title = para.text
+          const titleBlocks = [...pendingPageBreaks, encodeParagraph(para)]
+          pendingPageBreaks = []
           // Títulos em 2 linhas ("CAPÍTULO 3" / "A FUGA"): absorve o bloco
-          // seguinte se também for um marcador de capítulo — incluindo
-          // subtítulos tipográficos que sejam marcadores.
+          // seguinte se também for um marcador de capítulo.
           const next = pageParas[blockIndex + 1]
           if (next && isChapterMarker(next.text)) {
             const joined = `${title} — ${next.text}`
             if (joined.length <= CHAPTER_TITLE_MAX_LENGTH) {
               title = joined
+              titleBlocks.push(encodeParagraph(next))
               blockIndex++
             }
           }
-          current = { title, parts: [], startPage: pageIndex, pinned: false }
+          // O título permanece no corpo exatamente como aparece no PDF;
+          // `title` serve apenas como rótulo de navegação no sumário.
+          current = { title, parts: titleBlocks, startPage: pageIndex, pinned: styledPageTitle }
         } else {
           if (current) {
             current.parts.push(encodeParagraph(para))
@@ -860,6 +985,11 @@ export function detectChapters(
   return result.map(({ title, content, startPage }) => ({ title, content, startPage }))
 }
 
-function normalizeTitle(text: string): string {
-  return text.replace(/^@sub\d?:/, '').replace(/\s+/g, ' ').trim().toLowerCase()
+function normalizeChapterEvidence(text: string): string {
+  return text
+    .replace(/^@sub\d?:/, '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
 }

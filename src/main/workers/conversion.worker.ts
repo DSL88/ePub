@@ -55,7 +55,7 @@ async function ocrPages(
     for (let k = 0; k < pageIndices.length; k++) {
       const pageIndex = pageIndices[k]
       const imageBuffer = await renderPageToImage(doc, pageIndex, dpi)
-      results.set(pageIndex, await runOcr(imageBuffer, 'por'))
+      results.set(pageIndex, await runOcr(imageBuffer, 'por', 72 / dpi))
       makeProgress('ocr', 10 + ((k + 1) / pageIndices.length) * 50)
     }
   } finally {
@@ -183,10 +183,15 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
     if (ocrTargets.length > 0) {
       try {
         const ocrTexts = await ocrPages(filePath, ocrTargets, dpi)
-        pagesWithText = pagesWithText.map((page) => ({
-          ...page,
-          text: page.illustration ? '' : page.text || ocrTexts.get(page.index)?.text || ''
-        }))
+        pagesWithText = pagesWithText.map((page) => {
+          const ocr = ocrTexts.get(page.index)
+          const useOcrLines = !page.illustration && !page.text?.trim() && !!ocr?.text.trim()
+          return {
+            ...page,
+            ...(useOcrLines ? { lines: ocr?.lines } : {}),
+            text: page.illustration ? '' : page.text || ocr?.text || ''
+          }
+        })
       } catch {
         /* sem tesseract disponível: mantém apenas a camada de texto */
       }
@@ -207,7 +212,12 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
       const ocr = ocrResults.get(page.index)
       const text = ocr?.text ?? ''
       const isFigure = !text.trim() || (ocr?.meanConfidence ?? 0) < LOW_OCR_CONFIDENCE
-      return { ...page, illustration: isFigure || page.illustration === true, text: isFigure ? '' : text }
+      return {
+        ...page,
+        lines: isFigure ? page.lines : ocr?.lines ?? [],
+        illustration: isFigure || page.illustration === true,
+        text: isFigure ? '' : text
+      }
     })
   }
 

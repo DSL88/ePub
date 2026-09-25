@@ -8,6 +8,8 @@ export interface TextLine {
   x: number
   y: number
   fontSize: number
+  /** extensão horizontal da linha em unidades PDF, quando conhecida */
+  width?: number
   /** a linha é desenhada predominantemente com fonte Bold/Black/Heavy */
   bold?: boolean
 }
@@ -462,7 +464,7 @@ const PAGE_NUMBER_TOKEN_RE = /^(\d{1,5}|[IVXLCDM]{1,8})[.)]?$/i
  * (incluindo romanos) são a forma mais fiável; também são aceites quando
  * surgem no início ou no fim da mesma linha do título corrente.
  */
-function extractHeaderMetadata(lines: TextLine[]): { physicalPageNumber?: string; title: string } {
+export function extractHeaderMetadata(lines: TextLine[]): { physicalPageNumber?: string; title: string } {
   let physicalPageNumber: string | undefined
   const titleParts: string[] = []
 
@@ -675,6 +677,7 @@ function groupItemsIntoLines(items: PdfTextItem[], boldFonts: Set<string> = new 
     let prevEndX: number | null = null
     let fontSize = 0
     let minX = Infinity
+    let maxX = -Infinity
     let boldChars = 0
     let totalChars = 0
 
@@ -695,6 +698,7 @@ function groupItemsIntoLines(items: PdfTextItem[], boldFonts: Set<string> = new 
       prevEndX = part.x + (part.item.width ?? 0)
       fontSize = Math.max(fontSize, part.fontSize)
       minX = Math.min(minX, part.x)
+      maxX = Math.max(maxX, prevEndX)
     }
 
     const cleaned = text.replace(/\s+/g, ' ').trim()
@@ -709,6 +713,7 @@ function groupItemsIntoLines(items: PdfTextItem[], boldFonts: Set<string> = new 
       x: minX,
       y: group.baseline,
       fontSize: Number(fontSize.toFixed(1)),
+      width: Math.max(0, maxX - minX),
       ...(bold ? { bold: true } : {})
     })
   }

@@ -5,7 +5,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { promisify } from 'node:util'
 import { loadCanvasModule } from './canvasLoader'
-import type { PdfDocumentLike } from './pdfInspector'
+import type { PdfDocumentLike, TextLine } from './pdfInspector'
 
 const execFileAsync = promisify(execFile)
 
@@ -20,9 +20,15 @@ export type OcrLanguage = 'por'
 export interface OcrResult {
   text: string
   meanConfidence: number
+  /** linhas com coordenadas convertidas para unidades PDF */
+  lines: TextLine[]
 }
 
-export async function runOcr(imageBuffer: Buffer, lang: OcrLanguage = 'por'): Promise<OcrResult> {
+export async function runOcr(
+  imageBuffer: Buffer,
+  lang: OcrLanguage = 'por',
+  pixelToPdfScale = 1
+): Promise<OcrResult> {
   const token = randomBytes(8).toString('hex')
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `epub-ocr-${token}-`))
   const imagePath = path.join(dir, `page-${token}.png`)
@@ -38,7 +44,7 @@ export async function runOcr(imageBuffer: Buffer, lang: OcrLanguage = 'por'): Pr
         [imagePath, 'stdout', '-l', lang, '--psm', '3', 'tsv'],
         { timeout: OCR_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, windowsHide: true }
       )
-      return parseTesseractTsv(stdout)
+      return parseTesseractTsv(stdout, pixelToPdfScale)
     } catch (error) {
       throw translateOcrError(error, lang)
     }
@@ -52,6 +58,10 @@ interface TesseractWordRow {
   parKey: string
   word: string
   confidence: number
+  left: number
+  top: number
+  width: number
+  height: number
 }
 
 /**
@@ -59,15 +69,20 @@ interface TesseractWordRow {
  * preservando linhas e parágrafos (mudança de par → linha em branco) e
  * calculando a confiança média das palavras reconhecidas.
  */
-export function parseTesseractTsv(tsv: string): OcrResult {
+export function parseTesseractTsv(tsv: string, coordinateScale = 1): OcrResult {
   const rows = tsv.split(/\r?\n/)
   const words: TesseractWordRow[] = []
+  let imageHeight = 0
   for (const raw of rows.slice(1)) {
     const cols = raw.split('\t')
     if (cols.length < 12) {
       continue
     }
     const [level, , block, par, line] = cols
+    if (level === '1') {
+      imageHeight = Number(cols[9]) || imageHeight
+      continue
+    }
     if (level !== '5') {
       continue
     }
@@ -80,18 +95,40 @@ export function parseTesseractTsv(tsv: string): OcrResult {
       lineKey: `${block}:${par}:${line}`,
       parKey: `${block}:${par}`,
       word,
-      confidence: Number.isFinite(confidence) ? confidence : 0
+      confidence: Number.isFinite(confidence) ? confidence : 0,
+      left: Number(cols[6]) || 0,
+      top: Number(cols[7]) || 0,
+      width: Number(cols[8]) || 0,
+      height: Number(cols[9]) || 0
     })
+  }
+  if (imageHeight <= 0) {
+    imageHeight = words.reduce((height, word) => Math.max(height, word.top + word.height), 0)
   }
 
   const parts: string[] = []
+  const lines: TextLine[] = []
   let current: TesseractWordRow[] = []
   let lastParKey: string | null = null
   let lastLineKey: string | null = null
 
   const flushLine = (): void => {
     if (current.length > 0) {
-      parts.push(current.map((entry) => entry.word).join(' '))
+      const text = current.map((entry) => entry.word).join(' ')
+      const minTop = Math.min(...current.map((entry) => entry.top))
+      const maxBottom = Math.max(...current.map((entry) => entry.top + entry.height))
+      const x = Math.min(...current.map((entry) => entry.left))
+      const maxRight = Math.max(...current.map((entry) => entry.left + entry.width))
+      parts.push(text)
+      lines.push({
+        text,
+        x: x * coordinateScale,
+        width: Math.max(0, maxRight - x) * coordinateScale,
+        // O Tesseract mede top a partir do topo da imagem; TextLine.y usa a
+        // origem PDF no fundo da página.
+        y: Math.max(0, imageHeight - maxBottom) * coordinateScale,
+        fontSize: Math.max(0, maxBottom - minTop) * coordinateScale
+      })
       current = []
     }
   }
@@ -100,6 +137,9 @@ export function parseTesseractTsv(tsv: string): OcrResult {
     if (lastParKey !== null && entry.parKey !== lastParKey) {
       flushLine()
       parts.push('')
+      const previousY = lines[lines.length - 1]?.y ?? 0
+      const nextY = Math.max(0, imageHeight - (entry.top + entry.height)) * coordinateScale
+      lines.push({ text: '', x: 0, y: (previousY + nextY) / 2, fontSize: 0 })
     } else if (lastLineKey !== null && entry.lineKey !== lastLineKey) {
       flushLine()
     }
@@ -114,7 +154,7 @@ export function parseTesseractTsv(tsv: string): OcrResult {
     ? confidences.reduce((acc, value) => acc + value, 0) / confidences.length
     : 0
 
-  return { text: parts.join('\n'), meanConfidence }
+  return { text: parts.join('\n'), meanConfidence, lines }
 }
 
 function translateOcrError(error: unknown, lang: OcrLanguage): Error {

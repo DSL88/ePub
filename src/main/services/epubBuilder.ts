@@ -199,8 +199,12 @@ export async function buildEpub(
       lang: toEpubLanguage(language),
       css: BOOK_CSS,
       tocTitle: 'Índice',
-      prependChapterTitles: true,
-      numberChaptersInTOC: true,
+      // Os títulos de navegação têm de vir do próprio corpo do PDF; não se
+      // inventa um cabeçalho visível no EPUB para cada divisão técnica.
+      prependChapterTitles: false,
+      // O EPUB mantém os títulos como aparecem no PDF, sem numeração
+      // sequencial inventada por cima dos números impressos.
+      numberChaptersInTOC: false,
       date: new Date().toISOString().slice(0, 10),
       version: 3,
       ignoreFailedDownloads: false,
