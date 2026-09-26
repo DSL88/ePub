@@ -40,6 +40,30 @@ function pageLinesText(page: PdfPageContent): string {
   return (page.lines ?? []).map((line) => line.text).join('\n')
 }
 
+/**
+ * Páginas-título isoladas ("A detenção", "O PROCESSO") têm < 80 caracteres e,
+ * com um ornamento/vinheta, seriam classificadas como imageOnly — o texto era
+ * descartado e o título desaparecia do EPUB. Se a primeira linha tem aspeto
+ * de título e a página tem poucas linhas (não é um mapa com dezenas de
+ * rótulos), o texto é preservado.
+ */
+function looksLikeStandaloneTitle(page: PdfPageContent): boolean {
+  const lines = (page.lines ?? []).filter((line) => line.text.trim())
+  if (lines.length === 0 || lines.length > 8) {
+    return false
+  }
+  const first = lines[0].text.replace(/\s+/g, ' ').trim()
+  if (first.length < 4 || first.length > 70 || first.startsWith('@')) {
+    return false
+  }
+  if (/[.,;:!?…]$/.test(first) || /^[\dIVXLCDMivxlcdm]{1,6}\.?$/.test(first)) {
+    return false
+  }
+  const letters = first.replace(/[^a-zA-ZÀ-ÖØ-öø-ÿ]/g, '').length
+  const nonSpaces = first.replace(/\s/g, '').length
+  return nonSpaces > 0 && letters / nonSpaces >= 0.6
+}
+
 async function ocrPages(
   filePath: string,
   pageIndices: number[],
@@ -88,7 +112,25 @@ async function extractIllustrations(
   if (candidates.length === 0) {
     return { images: [], illustrationIds: new Map() }
   }
-  const chosen = candidates.length <= MAX_ILLUSTRATION_PAGES ? candidates : sampleEvenly(candidates, MAX_ILLUSTRATION_PAGES)
+  // Páginas imageOnly NÃO têm texto: a imagem É o conteúdo. Amostrá-las
+  // (sampleEvenly 40) apagava páginas do livro — foi o caso das páginas
+  // digitalizadas que "não estavam a ser convertidas". Inclui-as sempre;
+  // amostra só o excedente de illustration-com-texto (foto + legenda), onde
+  // a imagem é duplicado opcional e o texto já preserva o conteúdo.
+  const imageOnlyPages = candidates.filter((page) => page.imageOnly)
+  const illustratedTextPages = candidates.filter((page) => !page.imageOnly)
+  const budgetForIllustratedText = Math.max(0, MAX_ILLUSTRATION_PAGES - imageOnlyPages.length)
+  const chosenIllustrated =
+    illustratedTextPages.length <= budgetForIllustratedText
+      ? illustratedTextPages
+      : sampleEvenly(illustratedTextPages, Math.max(0, budgetForIllustratedText))
+  // Se nem as imageOnly couberem no teto absoluto, inclui pela ordem do
+  // livro até ao limite em vez de amostrar (amostrar apagava meio do livro).
+  const chosenImageOnly =
+    imageOnlyPages.length <= MAX_IMAGES_TOTAL
+      ? imageOnlyPages
+      : imageOnlyPages.slice(0, MAX_IMAGES_TOTAL)
+  const chosen = [...chosenImageOnly, ...chosenIllustrated].sort((a, b) => a.index - b.index)
   const images: EpubImageInput[] = []
   const illustrationIds = new Map<number, string[]>()
 
@@ -166,14 +208,22 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
   let pagesWithText: PdfPageContent[]
 
   if (inspection.mode === 'text-layer') {
-    // Páginas com operadores gráficos e pouco texto (< 80 caracteres, ex.:
-    // mapa vetorial com nomes de cidades) tornam-se ilustrações de página
-    // inteira: o texto disperso é descartado para não gerar falsos capítulos
-    // nem parágrafos fragmentados — a página NUNCA desaparece do ePub.
-    pagesWithText = inspection.pages.map((page) => ({
-      ...page,
-      text: page.illustration ? '' : pageLinesText(page)
-    }))
+    // Páginas de mapa/gráfico (< 80 car. + visuais → imageOnly) têm o texto
+    // disperso descartado para não gerar falsos capítulos — a página é
+    // rasterizada na íntegra e NUNCA desaparece. Páginas com 80-400 car.
+    // (illustration, ex.: título + ornamento + início de texto) MANTÊM o
+    // texto: descartá-lo apagava títulos de capítulo. Exceção: página-título
+    // isolada com ornamento (< 80 car. mas com aspeto de título) também
+    // mantém o texto.
+    pagesWithText = inspection.pages.map((page) => {
+      const keepTitle = looksLikeStandaloneTitle(page)
+      const discard = page.imageOnly && !keepTitle
+      return {
+        ...page,
+        ...(keepTitle ? { imageOnly: false, illustration: false } : {}),
+        text: discard ? '' : pageLinesText(page)
+      }
+    })
     // OCR apenas nas páginas com pouco texto e SEM visuais (visuais quase
     // sem texto tornam-se figuras rasterizadas, pelo que o OCR nelas seria
     // tempo perdido).
@@ -185,11 +235,11 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
         const ocrTexts = await ocrPages(filePath, ocrTargets, dpi)
         pagesWithText = pagesWithText.map((page) => {
           const ocr = ocrTexts.get(page.index)
-          const useOcrLines = !page.illustration && !page.text?.trim() && !!ocr?.text.trim()
+          const useOcrLines = !page.imageOnly && !page.text?.trim() && !!ocr?.text.trim()
           return {
             ...page,
             ...(useOcrLines ? { lines: ocr?.lines } : {}),
-            text: page.illustration ? '' : page.text || ocr?.text || ''
+            text: page.imageOnly ? '' : page.text || ocr?.text || ''
           }
         })
       } catch {
@@ -200,14 +250,23 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
     let ocrResults = new Map<number, OcrResult>()
     try {
       ocrResults = await ocrPages(filePath, inspection.pages.map((page) => page.index), dpi)
-    } catch {
-      /* sem tesseract: as páginas ficam sem texto e entram como ilustrações */
+    } catch (error) {
+      // Sem OCR um PDF digitalizado fica sem texto nenhum: falhar com
+      // mensagem clara (instalar tesseract) em vez de gerar um EPUB com
+      // páginas em falta por amostragem silenciosa.
+      const message = error instanceof Error ? error.message : String(error)
+      if (/tesseract/i.test(message)) {
+        throw error
+      }
+      /* outro erro: as páginas entram como ilustrações */
     }
     // Modo digitalizado: cada página é texto (OCR fiável) OU figura (sem
     // texto reconhecido, ou OCR de má qualidade — páginas estilizadas,
     // mapas): nesta última a página completa é rasterizada e o texto
     // reconhecido é descartado, para não gerar falsos capítulos nem
-    // parágrafos fragmentados.
+    // parágrafos fragmentados. Páginas com OCR bom deixam de ser
+    // illustration: o texto já é o conteúdo, rasterizá-las duplicava cada
+    // página e esgotava os tetos de imagens.
     pagesWithText = inspection.pages.map((page) => {
       const ocr = ocrResults.get(page.index)
       const text = ocr?.text ?? ''
@@ -215,10 +274,16 @@ async function convert(msg: ConversionRequestMessage): Promise<void> {
       return {
         ...page,
         lines: isFigure ? page.lines : ocr?.lines ?? [],
-        illustration: isFigure || page.illustration === true,
+        illustration: isFigure,
+        imageOnly: isFigure ? page.imageOnly : false,
         text: isFigure ? '' : text
       }
     })
+    if (ocrResults.size === 0 && pagesWithText.every((page) => !page.text?.trim())) {
+      throw new Error(
+        'OCR sem resultado: instala o Tesseract (`brew install tesseract tesseract-lang` no macOS ou `apt install tesseract-ocr tesseract-ocr-por` no Linux) e reconverte.'
+      )
+    }
   }
 
   makeProgress('sanitize', 65)

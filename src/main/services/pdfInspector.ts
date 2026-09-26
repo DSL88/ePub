@@ -722,8 +722,12 @@ export async function inspectPdf(
         const textContent = await page.getTextContent({ includeMarkedContent: true })
         const items = textContent.items.filter(isTextItem)
         const viewport = page.getViewport({ scale: 1.0 })
-        const headerY = viewport.height * 0.92
-        const footerY = viewport.height * 0.06
+        // Zona de cabeçalho estreita (topo 5%): títulos de capítulo como
+        // "A detenção" ficam ~8-12% abaixo do topo e TÊM de ficar no corpo.
+        // Com 8% (0.92) esses títulos iam para headerTitle e desapareciam do
+        // EPUB. Cabeçalhos correntes/números estão nos 3-4% extremos.
+        const headerY = viewport.height * 0.95
+        const footerY = viewport.height * 0.05
         // As transformações dos itens de texto estão no sistema PDF (origem
         // no fundo): separam-se as zonas antes de agrupar as linhas para que
         // cabeçalhos/rodapés nunca cheguem ao fluxo do corpo.

@@ -152,9 +152,11 @@ function createBoundedPreview(
 
 async function preview(filePath: string): Promise<ExtractionPreview> {
   const inspection = await inspectPdf(filePath)
+  // Mesma regra da conversão: só imageOnly descarta texto; illustration
+  // (80-400 car.) mantém texto para não esconder títulos com ornamentos.
   const pagesWithText = inspection.pages.map((page) => ({
     ...page,
-    text: page.illustration ? '' : pageText(page)
+    text: page.imageOnly ? '' : pageText(page)
   }))
   const sanitized = sanitizePages(pagesWithText)
 

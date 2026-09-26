@@ -329,3 +329,51 @@ test('sanitizePages does not absorb a chapter marker into an unfinished paragrap
     ]
   )
 })
+
+test('sanitizePages detects a literary title without styling when isolated at the page top', () => {
+  const result = sanitizePages([
+    positionedPage([
+      textLine('A detenção', 700),
+      textLine('Alguém devia ter caluniado Josef K., pois, sem ter feito', 600),
+      textLine('nada de mal, vieram detê-lo uma manhã.', 584)
+    ])
+  ])
+
+  assert.deepEqual(
+    result.paragraphs.map(({ text, kind }) => ({ text: text.slice(0, 12), kind })),
+    [
+      { text: 'A detenção', kind: 'subheading' },
+      { text: 'Alguém devia', kind: 'text' }
+    ]
+  )
+})
+
+test('sanitizePages keeps a title just below the old header cutoff in the body', () => {
+  const result = sanitizePages([
+    positionedPage([textLine('A detenção', 750), textLine('Primeira linha do corpo.', 600)])
+  ])
+
+  assert.ok(result.paragraphs.some((paragraph) => paragraph.text.includes('detenção')))
+})
+
+test('sanitizePages rejoins print hyphenation within a page', () => {
+  const result = sanitizePages([
+    positionedPage([
+      textLine('Pelo menos assim o entendeu o desconhecido, porque disse: «Não acha que seria melhor dei-', 700),
+      textLine('xar-se estar onde está?»', 684)
+    ])
+  ])
+
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'Pelo menos assim o entendeu o desconhecido, porque disse: «Não acha que seria melhor deixar-se estar onde está?»'
+  ])
+})
+
+test('sanitizePages rejoins hyphenation even without reliable geometry', () => {
+  const result = sanitizePages([
+    { index: 0, lines: [{ text: 'contra todos os regula-', x: 0, y: 0, fontSize: 0 }], height: 0, bodyFontSize: 0 },
+    { index: 1, lines: [{ text: 'mentos, também se tem comportado.', x: 0, y: 0, fontSize: 0 }], height: 0, bodyFontSize: 0 }
+  ])
+
+  assert.ok(result.paragraphs.some((paragraph) => paragraph.text.includes('regulamentos,')))
+})

@@ -211,6 +211,13 @@ function startsWithLowercaseLetter(text: string): boolean {
 function dehyphenateLines(lines: TextLine[]): TextLine[] {
   const fontSize = dominantBodyFontSize(lines)
   const normalGap = typicalLineGap(lines, fontSize)
+  // Linhas sintéticas (OCR sem coordenadas: fontSize 0, gaps artificiais de
+  // 100) têm geometria não fiável — sem este fallback a desifenização NUNCA
+  // corria para elas (gap 100 > maxLineBreak 18) e os hífens de fim de linha
+  // do papel ("dei- / xar-se") ficavam no EPUB. Prática padrão (Calibre
+  // --unwrap-factor, PyMuPDF: juntar linhas do mesmo bloco): sem geometria,
+  // decide só pelo texto.
+  const geometryReliable = fontSize > 0 && normalGap > 0
   const maxLineBreak = Math.max(normalGap * 1.6, fontSize * 2.2, 18)
   const out: TextLine[] = []
   for (const line of lines) {
@@ -219,28 +226,50 @@ function dehyphenateLines(lines: TextLine[]): TextLine[] {
     if (prev) {
       const prevTrim = prev.text.trimEnd()
       const next = text.trim()
-      const fontSize = Math.max(prev.fontSize, line.fontSize)
-      const verticalGap = prev.y - line.y
-      const nextStartsIndented =
-        line.x - prev.x >= Math.max(fontSize * 0.65, 5) &&
-        line.x - prev.x <= Math.max(fontSize * 3, 24)
-      const sameTextBlock =
-        verticalGap > 0 &&
-        verticalGap <= maxLineBreak &&
-        !nextStartsIndented &&
-        !isReadingFlowReset(prev, line, fontSize)
-      if (hasTrailingPhysicalHyphen(prevTrim) && next && sameTextBlock) {
-        if (startsWithLowercaseLetter(next)) {
-          prev.text = prevTrim.slice(0, -1) + next
-        } else {
-          prev.text = prevTrim + next
+      if (hasTrailingPhysicalHyphen(prevTrim) && next) {
+        if (!geometryReliable) {
+          if (startsWithLowercaseLetter(next)) {
+            prev.text = prevTrim.slice(0, -1) + next
+          } else {
+            prev.text = prevTrim + next
+          }
+          continue
         }
-        continue
+        const lineFontSize = Math.max(prev.fontSize, line.fontSize)
+        const verticalGap = prev.y - line.y
+        const nextStartsIndented =
+          line.x - prev.x >= Math.max(lineFontSize * 0.65, 5) &&
+          line.x - prev.x <= Math.max(lineFontSize * 3, 24)
+        const sameTextBlock =
+          verticalGap > 0 &&
+          verticalGap <= maxLineBreak &&
+          !nextStartsIndented &&
+          !isReadingFlowReset(prev, line, lineFontSize)
+        if (sameTextBlock) {
+          if (startsWithLowercaseLetter(next)) {
+            prev.text = prevTrim.slice(0, -1) + next
+          } else {
+            prev.text = prevTrim + next
+          }
+          continue
+        }
       }
     }
     out.push({ ...line, text })
   }
   return out
+}
+
+/**
+ * Rede de segurança: linhas que foram coladas com espaço ("dei- xar-se")
+ * porque a geometria vetou a desifenização têm de ser reparadas, senão o
+ * e-reader parte a linha no hífen e o texto parece "não seguido". Junta
+ * letra-hífen-espaços-letra.minúscula (padrão Calibre). Não toca em
+ * travessões ("palavra - continua": há espaço antes do hífen) nem em
+ * continuações maiúsculas (hínens lexicais preservados).
+ */
+export function repairLeftoverHyphenation(text: string): string {
+  return text.replace(/(\p{L})[-\u2010]\s+(\p{Ll})/gu, '$1$2')
 }
 
 /** Texto OCR: sem coordenadas; preserva espaços/linhas em branco tal como
@@ -298,11 +327,13 @@ function segmentPage(page: PdfPageContent, pageIndex: number): SegmentedPage {
   }
 
   const height = page.height!
-  const headerLines = page.lines!.filter((line) => line.text.trim() && line.y >= height * 0.92)
-  const footerLines = page.lines!.filter((line) => line.text.trim() && line.y <= height * 0.06)
+  // Mesma zona estreita do pdfInspector (topo 5% / fundo 5%): títulos de
+  // capítulo no topo (~8-12%) ficam no corpo, não no cabeçalho.
+  const headerLines = page.lines!.filter((line) => line.text.trim() && line.y >= height * 0.95)
+  const footerLines = page.lines!.filter((line) => line.text.trim() && line.y <= height * 0.05)
   const bodyLines = sourceLines.length === 0
     ? []
-    : page.lines!.filter((line) => line.y < height * 0.92 && line.y > height * 0.06)
+    : page.lines!.filter((line) => line.y < height * 0.95 && line.y > height * 0.05)
   const header = extractHeaderMetadata(headerLines)
   const footer = extractHeaderMetadata(footerLines)
 
@@ -473,6 +504,10 @@ function buildPageParagraphs(
   const bodyLeftByLine = commonBodyLeftByLine(lines, metrics.bodyFontSize)
   // Nível do subtítulo: 2 quando o destaque vem do tamanho (h2), 3 quando
   // vem apenas do peso da fonte (h3). `false` = não é subtítulo.
+  // Fallback literário: títulos como "A detenção" no topo da página, curtos,
+  // isolados por grande espaço branco, mesmo sem negrito/tamanho maior
+  // (comum em OCR onde o tamanho é ruidoso). Exige gap abaixo >= 2x para
+  // não confundir com a primeira linha de um parágrafo normal.
   const subheadingAt = lines.map((line, index): false | 2 | 3 => {
     const prev = index > 0 ? lines[index - 1] : undefined
     const next = index + 1 < lines.length ? lines[index + 1] : undefined
@@ -491,6 +526,30 @@ function buildPageParagraphs(
       index === firstContentIndex &&
       (line.bold === true || line.fontSize >= metrics.bodyFontSize * SUBHEADING_SIZE_FACTOR)
     if (!isSubheadingLine(line, metrics, separatedAbove || separatedBelow || prominentAtPageTop)) {
+      // Fallback sem tipografia: só no topo, só com geometria, só isolado.
+      if (
+        geometryAware &&
+        index === firstContentIndex &&
+        next?.text.trim()
+      ) {
+        const text = line.text.trim()
+        const gapBelow = line.y - next.y
+        const bigTitleGap = Math.max(lineGap * 2.0, line.fontSize * 2.0, 18)
+        const letters = text.replace(/[^a-zA-ZÀ-ÖØ-öø-ÿ]/g, '').length
+        const nonSpaces = text.replace(/\s/g, '').length
+        if (
+          text.length >= 4 &&
+          text.length <= SUBHEADING_MAX_LENGTH &&
+          !PAGE_NUMBER_RE.test(text) &&
+          !/[.,;:!?…]$/.test(text) &&
+          nonSpaces > 0 &&
+          letters / nonSpaces >= SUBHEADING_BOLD_RATIO &&
+          gapBelow > bigTitleGap &&
+          gapBelow > 0
+        ) {
+          return 2
+        }
+      }
       return false
     }
     return line.fontSize >= metrics.bodyFontSize * SUBHEADING_SIZE_FACTOR ? 2 : 3
@@ -506,7 +565,10 @@ function buildPageParagraphs(
   let previousLine: TextLine | null = null
 
   const flush = (): void => {
-    const text = parts.join(' ').replace(/\s+/g, ' ').trim()
+    const rawText = parts.join(' ').replace(/\s+/g, ' ').trim()
+    // Linhas coladas com espaço após falha de geometria ("dei- xar-se"):
+    // repara aqui para o parágrafo fluir no EPUB reflowável.
+    const text = repairLeftoverHyphenation(rawText)
     if (text) {
       const lastLine = end >= 0 ? lines[end] : undefined
       paragraphs.push({
