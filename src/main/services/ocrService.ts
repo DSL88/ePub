@@ -13,6 +13,15 @@ const OCR_TIMEOUT_MS = 5 * 60 * 1000
 
 export type OcrLanguage = 'por'
 
+/** Modos de segmentação do Tesseract oferecidos na UI: 3 = automático,
+ * 6 = bloco uniforme de texto (apanha linhas de borda que o 3 corta). */
+export const OCR_PSM_MODES = ['3', '6'] as const
+export type OcrPsm = (typeof OCR_PSM_MODES)[number]
+
+export function normalizeOcrPsm(value: unknown): OcrPsm {
+  return value === '6' ? '6' : '3'
+}
+
 /** Resultado do OCR: texto em linhas + confiança média das palavras (0-100).
  * A confiança distingue páginas bem digitalizadas (>90) de páginas
  * estilizadas/mapas/rasterizações pobres (<60), que devem ser renderizadas
@@ -27,11 +36,13 @@ export interface OcrResult {
 export async function runOcr(
   imageBuffer: Buffer,
   lang: OcrLanguage = 'por',
-  pixelToPdfScale = 1
+  pixelToPdfScale = 1,
+  psm: unknown = '3'
 ): Promise<OcrResult> {
   const token = randomBytes(8).toString('hex')
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), `epub-ocr-${token}-`))
   const imagePath = path.join(dir, `page-${token}.png`)
+  const mode = normalizeOcrPsm(psm)
 
   try {
     await fsp.writeFile(imagePath, imageBuffer)
@@ -41,7 +52,7 @@ export async function runOcr(
       // reconstruído a partir dele, numa única passagem.
       const { stdout } = await execFileAsync(
         'tesseract',
-        [imagePath, 'stdout', '-l', lang, '--psm', '3', 'tsv'],
+        [imagePath, 'stdout', '-l', lang, '--psm', mode, 'tsv'],
         { timeout: OCR_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024, windowsHide: true }
       )
       return parseTesseractTsv(stdout, pixelToPdfScale)

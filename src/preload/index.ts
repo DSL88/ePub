@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
-import type { ExtractionPreview } from '../renderer/src/types'
+import type { ExtractionPreview, PageOcrResult } from '../renderer/src/types'
 
 type Unsubscribe = () => void
 
@@ -29,6 +29,8 @@ const converterAPI = {
     ipcRenderer.invoke('preview-extraction', { filePath, requestId }),
   cancelExtractionPreview: (requestId: string): Promise<void> =>
     ipcRenderer.invoke('cancel-extraction-preview', requestId),
+  previewPageOcr: (filePath: string, pageIndex: number, psm?: string): Promise<PageOcrResult> =>
+    ipcRenderer.invoke('preview-page-ocr', { filePath, pageIndex, psm }),
   selectCover: (): Promise<{ path: string; name: string } | null> =>
     ipcRenderer.invoke('select-cover'),
   saveEpub: (defaultName: string): Promise<string | null> =>

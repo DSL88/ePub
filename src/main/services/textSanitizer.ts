@@ -37,6 +37,319 @@ export interface DetectedChapter {
   startPage: number
 }
 
+/** Marcação de linha vinda da pré-visualização (página + texto, tolerante). */
+export interface ParagraphLineMark {
+  /** 0-based PDF page index */
+  pageIndex: number
+  matchText: string
+  level: 'chapter' | 'subchapter' | 'ignore'
+}
+
+export function normalizeLineMarks(value: unknown): ParagraphLineMark[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const out: ParagraphLineMark[] = []
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue
+    }
+    const { pageIndex, lineText, level } = entry as {
+      pageIndex?: unknown
+      lineText?: unknown
+      level?: unknown
+    }
+    if (
+      typeof pageIndex !== 'number' ||
+      !Number.isInteger(pageIndex) ||
+      pageIndex < 0 ||
+      pageIndex > 100_000 ||
+      typeof lineText !== 'string' ||
+      !lineText.trim() ||
+      (level !== 'chapter' && level !== 'subchapter' && level !== 'ignore')
+    ) {
+      continue
+    }
+    out.push({ pageIndex, matchText: lineText.trim().slice(0, 500), level })
+  }
+  return out.slice(0, 500)
+}
+
+export function normalizeMatchText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+/** Correspondência tolerante: o parágrafo funde linhas (com espaços), por
+ * isso basta inclusão num dos sentidos. Exige >= 2 chars para não apanhar
+ * "o"/"a" em todo o lado. */
+function lineTextMatches(paragraphText: string, matchText: string): boolean {
+  const normalized = normalizeMatchText(matchText)
+  if (normalized.length < 2 || paragraphText.startsWith('@')) {
+    return false
+  }
+  const paragraph = normalizeMatchText(paragraphText)
+  return paragraph.includes(normalized) || normalized.includes(paragraph)
+}
+
+export interface LineExclusion {
+  /** 0-based PDF page index */
+  pageIndex: number
+  lineText: string
+}
+
+/**
+ * A página tem conteúdo afirmado pelo utilizador (marca de capítulo /
+ * subcapítulo ou linha manual): a heurística nunca a trata como figura nem
+ * lhe descarta o texto — o utilizador manda. 'ignore' sozinho não resgata
+ * (se só apagou linhas, a página pode continuar a ser figura).
+ */
+export function hasUserContentOnPage(
+  pageIndex: number,
+  lineMarks: ParagraphLineMark[],
+  manualLines: ManualLineInput[]
+): boolean {
+  return (
+    lineMarks.some((mark) => mark.pageIndex === pageIndex && mark.level !== 'ignore') ||
+    manualLines.some((manual) => manual.pageIndex === pageIndex)
+  )
+}
+
+/** Existe parágrafo correspondente à marca (leitura, não consome)? Usado
+ * para reportar marcas que não encontraram texto na conversão. */
+export function matchLineMarkExists(
+  paragraphs: SanitizedParagraph[],
+  mark: ParagraphLineMark
+): boolean {
+  if (mark.level === 'ignore') {
+    return true
+  }
+  return paragraphs.some(
+    (paragraph) =>
+      paragraph.startPage === mark.pageIndex && lineTextMatches(paragraph.text, mark.matchText)
+  )
+}
+
+export interface ManualLineInput {
+  /** 0-based PDF page index */
+  pageIndex: number
+  /** 'start' = topo da página (antes da 1ª linha), 'end' = fundo (depois da última) */
+  anchor: 'start' | 'end'
+  text: string
+}
+
+export interface LineOrderInput {
+  /** 0-based PDF page index */
+  pageIndex: number
+  /** textos das linhas na ordem escolhida pelo utilizador */
+  orderedTexts: string[]
+}
+
+export function normalizeManualLines(value: unknown): ManualLineInput[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const out: ManualLineInput[] = []
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue
+    }
+    const { pageIndex, anchor, text } = entry as {
+      pageIndex?: unknown
+      anchor?: unknown
+      text?: unknown
+    }
+    if (
+      typeof pageIndex !== 'number' ||
+      !Number.isInteger(pageIndex) ||
+      pageIndex < 0 ||
+      pageIndex > 100_000 ||
+      (anchor !== 'start' && anchor !== 'end') ||
+      typeof text !== 'string' ||
+      !text.trim()
+    ) {
+      continue
+    }
+    out.push({ pageIndex, anchor, text: text.replace(/\s+/g, ' ').trim().slice(0, 500) })
+  }
+  return out.slice(0, 500)
+}
+
+export function normalizeLineOrder(value: unknown): LineOrderInput[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const out: LineOrderInput[] = []
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue
+    }
+    const { pageIndex, orderedTexts } = entry as {
+      pageIndex?: unknown
+      orderedTexts?: unknown
+    }
+    if (
+      typeof pageIndex !== 'number' ||
+      !Number.isInteger(pageIndex) ||
+      pageIndex < 0 ||
+      pageIndex > 100_000 ||
+      !Array.isArray(orderedTexts)
+    ) {
+      continue
+    }
+    const texts = orderedTexts
+      .filter((text): text is string => typeof text === 'string' && text.trim().length > 0)
+      .map((text) => text.replace(/\s+/g, ' ').trim().slice(0, 500))
+    if (texts.length < 2) {
+      continue
+    }
+    out.push({ pageIndex, orderedTexts: texts.slice(0, 300) })
+  }
+  return out.slice(0, 500)
+}
+
+/**
+ * Reordena as linhas da página pela ordem escolhida na pré-visualização.
+ * Correspondência sequencial por igualdade normalizada (estável com
+ * duplicados); linhas do PDF que não constam da ordem mantêm-se no fim,
+ * pela ordem original — a conversão degrada com graça se o OCR divergir.
+ */
+export function reorderMarkedLines<T extends { index: number; lines?: TextLine[] }>(
+  pages: T[],
+  orders: LineOrderInput[]
+): T[] {
+  if (orders.length === 0) {
+    return pages
+  }
+  const byPage = new Map<number, string[]>()
+  for (const order of orders) {
+    const wanted = order.orderedTexts.map((text) => normalizeMatchText(text)).filter(Boolean)
+    if (wanted.length >= 2) {
+      byPage.set(order.pageIndex, wanted)
+    }
+  }
+  if (byPage.size === 0) {
+    return pages
+  }
+  return pages.map((page) => {
+    const wanted = byPage.get(page.index)
+    const lines = page.lines
+    if (!wanted || !lines || lines.length === 0) {
+      return page
+    }
+    const remaining = [...lines]
+    const out: TextLine[] = []
+    for (const text of wanted) {
+      const at = remaining.findIndex((line) => normalizeMatchText(line.text) === text)
+      if (at >= 0) {
+        out.push(...remaining.splice(at, 1))
+      }
+    }
+    out.push(...remaining)
+    return { ...page, lines: out }
+  })
+}
+
+/** Linha manual com coordenadas sintéticas dentro do corpo (fora das zonas
+ * de cabeçalho/rodapé de 5%): 'start' fica no topo e pode fundir com o
+ * parágrafo aberto da página anterior; 'end' fica no fundo e pode fundir
+ * para a frente. Usa a fonte e o x da linha vizinha para não parecer
+ * parágrafo novo (sem recuo). */
+function synthesizeManualLine(
+  text: string,
+  anchor: 'start' | 'end',
+  neighbor: TextLine | undefined,
+  page: PdfPageContent
+): TextLine {
+  const fontSize =
+    (neighbor && neighbor.fontSize > 0 ? neighbor.fontSize : 0) || page.bodyFontSize || 12
+  const height = page.height && page.height > 0 ? page.height : 800
+  return {
+    text,
+    x: neighbor?.x ?? 50,
+    y: anchor === 'start' ? height * 0.94 : height * 0.06,
+    fontSize,
+    ...(neighbor?.width ? { width: neighbor.width } : {})
+  }
+}
+
+/**
+ * Insere linhas ditadas pelo utilizador (falhas do OCR como a 1ª linha
+ * cortada no topo). Preserva a ordem de inserção dentro de cada âncora.
+ */
+export function insertManualLines(
+  pages: PdfPageContent[],
+  manuals: ManualLineInput[]
+): PdfPageContent[] {
+  if (manuals.length === 0) {
+    return pages
+  }
+  const starts = new Map<number, string[]>()
+  const ends = new Map<number, string[]>()
+  for (const manual of manuals) {
+    const target = manual.anchor === 'start' ? starts : ends
+    const list = target.get(manual.pageIndex) ?? []
+    list.push(manual.text)
+    target.set(manual.pageIndex, list)
+  }
+  if (starts.size === 0 && ends.size === 0) {
+    return pages
+  }
+  return pages.map((page) => {
+    const before = starts.get(page.index) ?? []
+    const after = ends.get(page.index) ?? []
+    if (before.length === 0 && after.length === 0) {
+      return page
+    }
+    const lines = page.lines ?? []
+    const first = lines.find((line) => line.text.trim())
+    const last = [...lines].reverse().find((line) => line.text.trim())
+    return {
+      ...page,
+      lines: [
+        ...before.map((text) => synthesizeManualLine(text, 'start', first, page)),
+        ...lines,
+        ...after.map((text) => synthesizeManualLine(text, 'end', last, page))
+      ]
+    }
+  })
+}
+
+/**
+ * Remove linhas marcadas como "ignorar" (números de página do livro,
+ * cabeçalhos perdidos, artefactos de OCR). Correspondência exata após
+ * normalização — ao contrário da tolerante usada para capítulos — para
+ * nunca apagar a linha errada.
+ */
+export function excludeMarkedLines<T extends { index: number; lines?: TextLine[] }>(
+  pages: T[],
+  exclusions: LineExclusion[]
+): T[] {
+  if (exclusions.length === 0) {
+    return pages
+  }
+  const byPage = new Map<number, Set<string>>()
+  for (const exclusion of exclusions) {
+    const normalized = normalizeMatchText(exclusion.lineText)
+    if (!Number.isInteger(exclusion.pageIndex) || normalized.length === 0) {
+      continue
+    }
+    const set = byPage.get(exclusion.pageIndex) ?? new Set<string>()
+    set.add(normalized)
+    byPage.set(exclusion.pageIndex, set)
+  }
+  if (byPage.size === 0) {
+    return pages
+  }
+  return pages.map((page) => {
+    const banned = byPage.get(page.index)
+    if (!banned || !page.lines || page.lines.length === 0) {
+      return page
+    }
+    const kept = page.lines.filter((line) => !banned.has(normalizeMatchText(line.text)))
+    return kept.length === page.lines.length ? page : { ...page, lines: kept }
+  })
+}
+
 export function pageText(page: PdfPageContent): string {
   if (typeof page.text === 'string') {
     return page.text
@@ -208,6 +521,45 @@ function startsWithLowercaseLetter(text: string): boolean {
   return !!firstLetter && /\p{Ll}/u.test(firstLetter)
 }
 
+/**
+ * Esquerdas que quase nunca quebram por hifenização discricionária: quando
+ * aparecem antes de um hífen de fim de linha, é composto com hífen fixo
+ * ("pequeno-almoço", "fim-de-semana", "bem-vindo") e o hífen TEM de ficar.
+ * Excluídos de propósito os prefixos ambíguos ("ex-": "exceto" vs
+ * "ex-mulher"; "sub-", "contra-"): aí a quebra discricionária é muito mais
+ * frequente e manda remover. Sem dicionário local, esta lista curta é o
+ * compromisso documentado (a prática com dicionário — pd3f/dehyphen com
+ * modelos de linguagem — não cabe numa app offline).
+ */
+const HYPHEN_COMPOUND_LEFTS = new Set([
+  'pequeno', 'grande', 'meio', 'meia', 'fim', 'dia', 'cara', 'conta',
+  'saca', 'chupa', 'ano', 'bem', 'mal', 'recém', 'além', 'aquém',
+  'vice', 'soto', 'arco', 'pré', 'pós', 'pró', 'pé'
+])
+
+/**
+ * Decide se o hífen de fim de linha é lexical (mantém) ou discricionário
+ * (remove). Mantém quando: a direita é o pronome "lhe" (nenhuma palavra
+ * portuguesa começa por "lhe", é sempre ênclise/mesóclise: "disse-lhe",
+ * "dir-lhe-ei"); ou a esquerda é um composto fixo E a direita tem 2+ letras
+ * ou traz hífen ("almoço", "a-dia" — mas não o "s" de "pé-s" → "pés").
+ */
+function keepHyphenForCompound(prevTrimmed: string, next: string): boolean {
+  const left = prevTrimmed.replace(/[-\u2010]\s*$/, '').match(/([\p{L}]+)$/u)?.[1]?.toLowerCase()
+  if (!left) {
+    return false
+  }
+  const right = next.trimStart()
+  if (/^(lhe|lhes)(?![\p{L}])/iu.test(right)) {
+    return true
+  }
+  if (!HYPHEN_COMPOUND_LEFTS.has(left)) {
+    return false
+  }
+  const rightToken = right.match(/^[\p{L}]+/u)?.[0] ?? ''
+  return rightToken.length >= 2 || right.slice(rightToken.length).startsWith('-') || right.slice(rightToken.length).startsWith('\u2010')
+}
+
 function dehyphenateLines(lines: TextLine[]): TextLine[] {
   const fontSize = dominantBodyFontSize(lines)
   const normalGap = typicalLineGap(lines, fontSize)
@@ -229,7 +581,7 @@ function dehyphenateLines(lines: TextLine[]): TextLine[] {
       if (hasTrailingPhysicalHyphen(prevTrim) && next) {
         if (!geometryReliable) {
           if (startsWithLowercaseLetter(next)) {
-            prev.text = prevTrim.slice(0, -1) + next
+            prev.text = keepHyphenForCompound(prevTrim, next) ? prevTrim + next : prevTrim.slice(0, -1) + next
           } else {
             prev.text = prevTrim + next
           }
@@ -247,7 +599,7 @@ function dehyphenateLines(lines: TextLine[]): TextLine[] {
           !isReadingFlowReset(prev, line, lineFontSize)
         if (sameTextBlock) {
           if (startsWithLowercaseLetter(next)) {
-            prev.text = prevTrim.slice(0, -1) + next
+            prev.text = keepHyphenForCompound(prevTrim, next) ? prevTrim + next : prevTrim.slice(0, -1) + next
           } else {
             prev.text = prevTrim + next
           }
@@ -264,12 +616,15 @@ function dehyphenateLines(lines: TextLine[]): TextLine[] {
  * Rede de segurança: linhas que foram coladas com espaço ("dei- xar-se")
  * porque a geometria vetou a desifenização têm de ser reparadas, senão o
  * e-reader parte a linha no hífen e o texto parece "não seguido". Junta
- * letra-hífen-espaços-letra.minúscula (padrão Calibre). Não toca em
- * travessões ("palavra - continua": há espaço antes do hífen) nem em
- * continuações maiúsculas (hínens lexicais preservados).
+ * letra-hífen-espaços-letra.minúscula (padrão Calibre), mas preserva o
+ * hífen nos compostos fixos ("pequeno- almoço" → "pequeno-almoço"). Não
+ * toca em travessões ("palavra - continua": há espaço antes do hífen) nem
+ * em continuações maiúsculas (hínens lexicais preservados).
  */
 export function repairLeftoverHyphenation(text: string): string {
-  return text.replace(/(\p{L})[-\u2010]\s+(\p{Ll})/gu, '$1$2')
+  return text.replace(/([\p{L}]+)[-\u2010]\s+(\p{Ll}[\p{L}]*)/gu, (match, left: string, right: string) =>
+    keepHyphenForCompound(`${left}-`, right) ? `${left}-${right}` : `${left}${right}`
+  )
 }
 
 /** Texto OCR: sem coordenadas; preserva espaços/linhas em branco tal como
@@ -563,6 +918,21 @@ function buildPageParagraphs(
   let blockKind: ParagraphKind = 'text'
   let blockLevel: 2 | 3 = 2
   let previousLine: TextLine | null = null
+  // Último bloco fechado (para retomar após linha em branco) e última linha
+  // com conteúdo (para o teste de fluxo de leitura através de brancos).
+  // Em objeto-ref (não `let` direto): o `flush()` atribui-o dentro de um
+  // closure e o CFA do TS estreitaria um `let` para `null`/`never`.
+  interface ResumableBlock {
+    text: string
+    kind: ParagraphKind
+    level: 2 | 3
+    afterBigGap: boolean
+    firstLineIndex: number
+    lastLineIndex: number
+  }
+  const prevBlockRef: { current: ResumableBlock | null } = { current: null }
+  let pendingBlank = false
+  let lastContentLine: TextLine | null = null
 
   const flush = (): void => {
     const rawText = parts.join(' ').replace(/\s+/g, ' ').trim()
@@ -594,6 +964,14 @@ function buildPageParagraphs(
         kind: blockKind,
         level: blockLevel
       })
+      prevBlockRef.current = {
+        text,
+        kind: blockKind,
+        level: blockLevel,
+        afterBigGap,
+        firstLineIndex: start,
+        lastLineIndex: end
+      }
     }
     parts = []
     start = -1
@@ -608,12 +986,52 @@ function buildPageParagraphs(
     const line = lines[i]
     const raw = line.text
     if (!raw.trim()) {
-      flush()
+      if (parts.length > 0) {
+        flush()
+      }
+      pendingBlank = true
       continue
     }
 
     const lineLevel = subheadingAt[i]
     const lineKind: ParagraphKind = lineLevel ? 'subheading' : 'text'
+    // Quebra de parágrafo do OCR (linha em branco entre blocos do
+    // Tesseract) a meio de frase inacabada com continuação em minúscula:
+    // é a mesma frase ("...um homem, que" / "nunca vira...") — retoma o
+    // bloco em vez de partir. Nunca sem linha em branco pelo meio, nunca
+    // através de mudança de fluxo/coluna, subtítulos ou marcadores.
+    const hadBlank = pendingBlank
+    pendingBlank = false
+    const candidate = prevBlockRef.current
+    if (
+      parts.length === 0 &&
+      hadBlank &&
+      candidate !== null &&
+      candidate.kind === 'text' &&
+      lineKind === 'text' &&
+      !isChapterMarker(candidate.text) &&
+      !isChapterMarker(raw.trim()) &&
+      !SENTENCE_END_RE.test(candidate.text.trimEnd()) &&
+      startsWithLowercaseLetter(raw) &&
+      lastContentLine !== null &&
+      !isReadingFlowReset(lastContentLine, line, metrics.bodyFontSize)
+    ) {
+      const resumeFrom = candidate
+      paragraphs.pop()
+      parts = [resumeFrom.text]
+      start = resumeFrom.firstLineIndex
+      end = resumeFrom.lastLineIndex
+      blockKind = 'text'
+      blockLevel = resumeFrom.level
+      afterBigGap = resumeFrom.afterBigGap
+      previousLine = lines[end] ?? null
+      prevBlockRef.current = null
+      parts.push(raw.trim())
+      previousLine = line
+      lastContentLine = line
+      end = i
+      continue
+    }
     // um subtítulo nunca partilha bloco com o parágrafo: quebra antes e
     // depois, sem forçar quebra de capítulo
     if (parts.length > 0 && blockKind !== lineKind) {
@@ -647,6 +1065,7 @@ function buildPageParagraphs(
 
     parts.push(raw.trim())
     previousLine = line
+    lastContentLine = line
     end = i
   }
   flush()
@@ -674,7 +1093,12 @@ function buildPageParagraphs(
   return paragraphs
 }
 
-export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
+export type PageBoundaryDecision = 'join' | 'break' | 'chapter'
+
+export function sanitizePages(
+  pages: PdfPageContent[],
+  boundaryOverrides?: Record<number, PageBoundaryDecision>
+): SanitizedText {
   const segmentedPages = pages.map((page, pageIndex) => segmentPage(page, pageIndex))
   const pageLineSets = segmentedPages.map((page) =>
     page.geometryAware ? page.lines : stripPageNumberLines(page.lines)
@@ -763,12 +1187,37 @@ export function sanitizePages(pages: PdfPageContent[]): SanitizedText {
         // A terminal sentence is ambiguous even when both blocks are flush-left.
         // An unfinished fragment (including a trailing hard hyphen) is positive
         // evidence; indentation/gap, headings, and non-edge geometry veto it.
-        const continuesMidSentence =
+        const autoContinues =
           isAdjacentPageTop &&
           isTextFlow &&
           !hasNewParagraphEvidence &&
           previousLooksUnfinished &&
           previousReachedPageEdge
+
+        // Continuação textual forte: frase inacabada + próxima a começar em
+        // minúscula ("...um homem, que" / "nunca vira..."). O início em
+        // minúscula prova que é a mesma frase — mais forte que os vetos de
+        // geometria (fundo de página) ou recuo (jitter do OCR). Não junta
+        // após frase terminada nem com subtítulos/marcadores (isTextFlow).
+        const strongLowercaseContinuation =
+          isAdjacentPageTop &&
+          isTextFlow &&
+          previousLooksUnfinished &&
+          startsWithLowercaseLetter(para.text)
+
+        // Overrides manuais do editor de fronteiras (indexados pela página de
+        // destino): 'join' força a continuação, 'break'/'chapter' vetam-na.
+        // 'chapter' comporta-se como 'break' aqui; a divisão de capítulo é
+        // feita em detectChapters via marcas.
+        const override = boundaryOverrides?.[pageIndex]
+        let continuesMidSentence = autoContinues || strongLowercaseContinuation
+        if (isAdjacentPageTop && isTextFlow && override) {
+          if (override === 'join') {
+            continuesMidSentence = true
+          } else {
+            continuesMidSentence = false
+          }
+        }
 
         if (continuesMidSentence) {
           open = { ...open, text: joinParagraphFragments(open.text, para.text) }
@@ -808,9 +1257,10 @@ function joinParagraphFragments(prev: string, next: string): string {
   const previous = prev.trimEnd()
   const following = next.trimStart()
   if (hasTrailingPhysicalHyphen(previous)) {
-    if (startsWithLowercaseLetter(following)) {
+    if (startsWithLowercaseLetter(following) && !keepHyphenForCompound(previous, following)) {
       // Repair only lowercase word continuations; uppercase starts keep their
       // hyphen because a lexical hyphen is otherwise indistinguishable.
+      // Compostos fixos ("pequeno-" + "almoço") mantêm o hífen.
       return previous.slice(0, -1) + following
     }
     return previous + following
@@ -854,7 +1304,8 @@ export function detectChapters(
   illustrations?: Map<number, string[]>,
   explicitMarks?: number[],
   outline?: PdfOutlineEntry[],
-  pageMetadata: SanitizedPageMetadata[] = []
+  pageMetadata: SanitizedPageMetadata[] = [],
+  lineMarks: ParagraphLineMark[] = []
 ): DetectedChapter[] {
   interface WorkingChapter {
     title: string
@@ -977,6 +1428,42 @@ export function detectChapters(
   // Com outline nativo válido, a heurística de texto fica desligada: o
   // sumário do documento é a autoridade para as quebras de capítulo.
   // (hasNativeOutline calculado acima a partir do nível escolhido.)
+
+  // Marcações de linha do utilizador (pré-visualização): 'subchapter' força
+  // o parágrafo correspondente a subtítulo (h2); 'chapter' é consumido no
+  // ciclo principal e abre capítulo mesmo a meio da página. Cada marca é
+  // usada uma vez (primeiro parágrafo correspondente, por ordem).
+  // 'ignore' não chega aqui: as linhas ignoradas já foram removidas antes
+  // do sanitize (ver excludeMarkedLines na conversão).
+  const pendingLineChapters = new Map<number, ParagraphLineMark[]>()
+  for (const mark of lineMarks) {
+    if (mark.level === 'subchapter') {
+      const target = paragraphs.find(
+        (paragraph) =>
+          paragraph.startPage === mark.pageIndex && lineTextMatches(paragraph.text, mark.matchText)
+      )
+      if (target && target.kind !== 'subheading') {
+        target.kind = 'subheading'
+        target.level = 2
+      }
+    } else if (mark.level === 'chapter') {
+      const list = pendingLineChapters.get(mark.pageIndex) ?? []
+      list.push(mark)
+      pendingLineChapters.set(mark.pageIndex, list)
+    }
+  }
+  const consumeLineChapter = (pageIndex: number, paragraphText: string): boolean => {
+    const list = pendingLineChapters.get(pageIndex)
+    if (!list || list.length === 0) {
+      return false
+    }
+    const at = list.findIndex((mark) => lineTextMatches(paragraphText, mark.matchText))
+    if (at < 0) {
+      return false
+    }
+    list.splice(at, 1)
+    return true
+  }
 
   const groupsByPage = new Map<number, SanitizedParagraph[]>()
   for (const paragraph of paragraphs) {
@@ -1109,7 +1596,10 @@ export function detectChapters(
 
       for (let blockIndex = 0; blockIndex < pageParas.length; blockIndex++) {
         const para = pageParas[blockIndex]
-        if (startsHeuristicChapter(para)) {
+        // Marca de linha do utilizador prevalece sobre a heurística; numa
+        // página com hint de outline/marca o hint (ramo acima) já decidiu.
+        const lineChapter = consumeLineChapter(pageIndex, para.text)
+        if (startsHeuristicChapter(para) || lineChapter) {
           sawChapterMarker = true
           closeCurrent()
 
@@ -1130,7 +1620,8 @@ export function detectChapters(
           }
           // O título permanece no corpo exatamente como aparece no PDF;
           // `title` serve apenas como rótulo de navegação no sumário.
-          current = { title, parts: titleBlocks, startPage: pageIndex, pinned: styledPageTitle }
+          // Capítulos marcados pelo utilizador nunca são fundidos.
+          current = { title, parts: titleBlocks, startPage: pageIndex, pinned: styledPageTitle || lineChapter }
         } else {
           if (current) {
             current.parts.push(encodeParagraph(para))

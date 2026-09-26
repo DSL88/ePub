@@ -68,13 +68,17 @@ export default function DropZone({ selectedFile, onSelect, onClear }: DropZonePr
           const file = e.dataTransfer.files[0]
           if (file) void handleLocalFile(file)
         }}
-        className={`flex cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed p-10 text-center transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+        className={`flex cursor-pointer flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed p-10 text-center shadow-sm transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
           dragOver
-            ? 'border-blue-500 bg-blue-500/10'
-            : 'border-neutral-300 bg-white hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800/60'
+            ? 'scale-[1.01] border-blue-500 bg-blue-500/10 shadow-md shadow-blue-600/10'
+            : 'border-neutral-300 bg-white hover:border-blue-400 hover:bg-blue-50/40 dark:border-white/10 dark:bg-neutral-900 dark:hover:border-blue-500/50 dark:hover:bg-blue-500/5'
         }`}
       >
-        <FileUp className="h-10 w-10 text-neutral-500 dark:text-neutral-400" />
+        <div className={`flex h-14 w-14 items-center justify-center rounded-2xl transition-colors ${
+          dragOver ? 'bg-blue-600 text-white' : 'bg-blue-600/10 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400'
+        }`}>
+          <FileUp className="h-7 w-7" />
+        </div>
         <div>
           <p className="font-medium text-neutral-900 dark:text-neutral-100">
             Arrasta o teu PDF aqui
@@ -109,20 +113,25 @@ export default function DropZone({ selectedFile, onSelect, onClear }: DropZonePr
       )}
 
       {selectedFile && (
-        <div className="mt-3 flex items-center justify-between rounded-xl bg-neutral-100 px-4 py-3 dark:bg-neutral-800">
-          <div className="min-w-0">
-            <p className="truncate font-medium text-neutral-900 dark:text-neutral-100">
-              {selectedFile.name}
-            </p>
-            <p className="text-sm text-neutral-500 dark:text-neutral-400">
-              {formatSize(selectedFile.size)}
-            </p>
+        <div className="mt-3 flex items-center justify-between gap-4 rounded-2xl border border-neutral-200 bg-white px-4 py-3 shadow-sm dark:border-white/10 dark:bg-neutral-900">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-500/10 text-red-500">
+              <FileUp className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <p className="truncate font-medium text-neutral-900 dark:text-neutral-100">
+                {selectedFile.name}
+              </p>
+              <p className="text-sm text-neutral-500 dark:text-neutral-400">
+                {formatSize(selectedFile.size)}
+              </p>
+            </div>
           </div>
           {onClear && (
             <button
               type="button"
               onClick={onClear}
-              className="ml-4 shrink-0 text-sm text-neutral-500 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400"
+              className="shrink-0 rounded-lg px-2 py-1 text-sm font-medium text-neutral-500 transition-colors hover:bg-red-500/10 hover:text-red-600 dark:text-neutral-400 dark:hover:text-red-400"
             >
               Remover
             </button>

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { ConversionProgress, Metadata } from '../types'
+import type { AppliedSummary, ConversionProgress, Metadata } from '../types'
 
 export type ConversionStatus = 'idle' | 'converting' | 'done' | 'error'
 
@@ -7,6 +7,7 @@ export interface UseConversionState {
   status: ConversionStatus
   progress: ConversionProgress
   outputPath: string | null
+  applied: AppliedSummary | null
   error: string | null
 }
 
@@ -23,6 +24,7 @@ const initialState: UseConversionState = {
   status: 'idle',
   progress: { stage: '', percent: 0 },
   outputPath: null,
+  applied: null,
   error: null
 }
 
@@ -41,6 +43,7 @@ export function useConversion(): UseConversionResult {
         ...prev,
         status: 'done',
         outputPath: data.outputPath,
+        applied: data.applied ?? null,
         progress: { ...prev.progress, percent: 100 }
       }))
     })

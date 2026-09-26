@@ -2,7 +2,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { Worker } from 'node:worker_threads'
 import type { Dialog, IpcMain, WebContents } from 'electron'
-import type { ExtractionPreview } from '../../renderer/src/types'
+import type { ExtractionPreview, PageOcrResult } from '../../renderer/src/types'
 import type {
   ConversionMetadata,
   ConversionOptions,
@@ -124,11 +124,24 @@ function isExtractionPreview(value: unknown): value is ExtractionPreview {
   )
 }
 
+function isPageOcrResult(value: unknown): value is PageOcrResult {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+  const result = value as Partial<PageOcrResult>
+  return (
+    typeof result.pageIndex === 'number' &&
+    Array.isArray(result.lines) &&
+    typeof result.meanConfidence === 'number'
+  )
+}
+
 function spawnPreviewWorker(
-  filePath: string,
+  message: { type: 'preview'; filePath: string } | { type: 'page-ocr'; filePath: string; pageIndex: number; psm?: unknown },
   sender: WebContents,
-  task: ActivePreviewTask
-): Promise<ExtractionPreview> {
+  task: ActivePreviewTask | null,
+  isValid: (payload: unknown) => boolean
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let worker: Worker
     try {
@@ -145,7 +158,9 @@ function spawnPreviewWorker(
     const cleanup = (): void => {
       sender.removeListener('destroyed', onSenderDestroyed)
       worker.removeAllListeners()
-      task.cancelWorker = undefined
+      if (task) {
+        task.cancelWorker = undefined
+      }
     }
 
     const finishWithError = (error: Error): void => {
@@ -158,22 +173,24 @@ function spawnPreviewWorker(
       reject(error)
     }
 
-    const finishWithPreview = (preview: ExtractionPreview): void => {
+    const finishWithResult = (result: unknown): void => {
       if (settled) {
         return
       }
       settled = true
       cleanup()
       void worker.terminate().catch(() => undefined)
-      resolve(preview)
+      resolve(result)
     }
 
     const onSenderDestroyed = (): void => {
       finishWithError(new Error('A janela foi fechada durante a pré-visualização.'))
     }
 
-    task.cancelWorker = (message: string): void => {
-      finishWithError(new Error(message))
+    if (task) {
+      task.cancelWorker = (message: string): void => {
+        finishWithError(new Error(message))
+      }
     }
 
     worker.on('message', (message: unknown) => {
@@ -182,9 +199,12 @@ function spawnPreviewWorker(
         return
       }
 
-      const response = message as { type?: unknown; message?: unknown; preview?: unknown }
-      if (response.type === 'done' && isExtractionPreview(response.preview)) {
-        finishWithPreview(response.preview)
+      const response = message as { type?: unknown; message?: unknown; preview?: unknown; pageOcr?: unknown }
+      if (
+        (response.type === 'preview-done' || response.type === 'page-ocr-done') &&
+        isValid(response.type === 'preview-done' ? response.preview : response.pageOcr)
+      ) {
+        finishWithResult(response.type === 'preview-done' ? response.preview : response.pageOcr)
       } else if (response.type === 'error' && typeof response.message === 'string') {
         finishWithError(new Error(response.message))
       } else {
@@ -201,7 +221,7 @@ function spawnPreviewWorker(
     sender.once('destroyed', onSenderDestroyed)
 
     try {
-      worker.postMessage({ type: 'preview', filePath })
+      worker.postMessage(message)
     } catch (error) {
       finishWithError(error instanceof Error ? error : new Error(String(error)))
     }
@@ -239,7 +259,7 @@ function spawnConversionWorker(payload: ConversionRequestMessage, sender: WebCon
     if (message.type === 'progress') {
       sender.send('conversion-progress', { stage: message.stage, percent: message.percent })
     } else if (message.type === 'done') {
-      sender.send('conversion-done', { outputPath: message.outputPath })
+      sender.send('conversion-done', { outputPath: message.outputPath, applied: message.applied })
     } else if (message.type === 'error') {
       reportedError = true
       sender.send('conversion-error', { message: message.message })
@@ -363,12 +383,47 @@ export function registerConversionHandlers(ipcMain: IpcMain, dialog: Dialog): vo
         if (event.sender.isDestroyed()) {
           throw new Error('A janela foi fechada durante a pré-visualização.')
         }
-        return await spawnPreviewWorker(filePath, event.sender, task)
+        return (await spawnPreviewWorker(
+          { type: 'preview', filePath },
+          event.sender,
+          task,
+          isExtractionPreview
+        )) as ExtractionPreview
       } finally {
         if (activePreviewTask === task) {
           activePreviewTask = null
         }
       }
+    }
+  )
+
+  ipcMain.handle(
+    'preview-page-ocr',
+    async (
+      event,
+      payload?: { filePath?: unknown; pageIndex?: unknown; psm?: unknown }
+    ): Promise<PageOcrResult> => {
+      if (!payload || typeof payload.filePath !== 'string' || !payload.filePath.trim()) {
+        throw new Error('Caminho de PDF inválido.')
+      }
+      if (
+        typeof payload.pageIndex !== 'number' ||
+        !Number.isInteger(payload.pageIndex) ||
+        payload.pageIndex < 0 ||
+        payload.pageIndex > 100_000
+      ) {
+        throw new Error('Página inválida para OCR.')
+      }
+      const filePath = await validatePreviewPdfPath(payload.filePath)
+      if (event.sender.isDestroyed()) {
+        throw new Error('A janela foi fechada durante o OCR.')
+      }
+      return (await spawnPreviewWorker(
+        { type: 'page-ocr', filePath, pageIndex: payload.pageIndex, psm: payload.psm },
+        event.sender,
+        null,
+        isPageOcrResult
+      )) as PageOcrResult
     }
   )
 

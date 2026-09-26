@@ -13,6 +13,17 @@ let temporaryDirectory
 let layoutPdfTextItems
 let getTaggedTextItemOrder
 let sanitizePages
+let detectChapters
+let normalizeLineMarks
+let excludeMarkedLines
+let normalizeMatchText
+let insertManualLines
+let reorderMarkedLines
+let normalizeManualLines
+let normalizeLineOrder
+let hasUserContentOnPage
+let matchLineMarkExists
+let repairLeftoverHyphenation
 
 before(async () => {
   temporaryDirectory = await mkdtemp(join(tmpdir(), 'pdf-to-epub-regression-'))
@@ -36,6 +47,17 @@ before(async () => {
   layoutPdfTextItems = pdfInspector.layoutPdfTextItems
   getTaggedTextItemOrder = pdfInspector.getTaggedTextItemOrder
   sanitizePages = textSanitizer.sanitizePages
+  detectChapters = textSanitizer.detectChapters
+  normalizeLineMarks = textSanitizer.normalizeLineMarks
+  insertManualLines = textSanitizer.insertManualLines
+  reorderMarkedLines = textSanitizer.reorderMarkedLines
+  normalizeManualLines = textSanitizer.normalizeManualLines
+  normalizeLineOrder = textSanitizer.normalizeLineOrder
+  hasUserContentOnPage = textSanitizer.hasUserContentOnPage
+  matchLineMarkExists = textSanitizer.matchLineMarkExists
+  repairLeftoverHyphenation = textSanitizer.repairLeftoverHyphenation
+  excludeMarkedLines = textSanitizer.excludeMarkedLines
+  normalizeMatchText = textSanitizer.normalizeMatchText
 })
 
 after(async () => {
@@ -376,4 +398,352 @@ test('sanitizePages rejoins hyphenation even without reliable geometry', () => {
   ])
 
   assert.ok(result.paragraphs.some((paragraph) => paragraph.text.includes('regulamentos,')))
+})
+
+test('detectChapters opens a chapter at a user-marked line mid-page', () => {
+  const sanitized = sanitizePages([
+    positionedPage([textLine('Texto de abertura completo.', 100)]),
+    positionedPage([
+      textLine('A história continua por aqui dentro.', 700),
+      textLine('e prossegue sem parar.', 684),
+      textLine('O Regresso', 600)
+    ])
+  ])
+  const plain = detectChapters(sanitized.paragraphs)
+  assert.equal(plain.length, 1)
+
+  const marked = detectChapters(
+    sanitized.paragraphs,
+    undefined,
+    undefined,
+    undefined,
+    sanitized.pages,
+    normalizeLineMarks([{ pageIndex: 1, lineText: 'O Regresso', level: 'chapter' }])
+  )
+  assert.equal(marked.length, 2)
+  assert.equal(marked[1].title, 'O Regresso')
+})
+
+test('detectChapters forces a user-marked line to subheading', () => {
+  const sanitized = sanitizePages([
+    positionedPage([
+      textLine('A história continua por aqui dentro.', 700),
+      textLine('e prossegue sem parar.', 684),
+      textLine('Recordações antigas', 600)
+    ])
+  ])
+  const marked = detectChapters(
+    sanitized.paragraphs,
+    undefined,
+    undefined,
+    undefined,
+    sanitized.pages,
+    normalizeLineMarks([{ pageIndex: 0, lineText: 'Recordações antigas', level: 'subchapter' }])
+  )
+  assert.ok(marked[0].content.includes('@sub:Recordações antigas'))
+})
+
+test('normalizeLineMarks rejects invalid entries', () => {
+  assert.deepEqual(
+    normalizeLineMarks([
+      { pageIndex: 2, lineText: 'O Regresso', level: 'chapter' },
+      { pageIndex: -1, lineText: 'X', level: 'chapter' },
+      { pageIndex: 1, lineText: ' ', level: 'chapter' },
+      { pageIndex: 1, lineText: 'Y', level: 'nonsense' },
+      null
+    ]),
+    [{ pageIndex: 2, matchText: 'O Regresso', level: 'chapter' }]
+  )
+})
+
+test('normalizeLineMarks accepts ignore level', () => {
+  assert.deepEqual(
+    normalizeLineMarks([{ pageIndex: 3, lineText: '12', level: 'ignore' }]),
+    [{ pageIndex: 3, matchText: '12', level: 'ignore' }]
+  )
+})
+
+test('detectChapters never opens a chapter from an ignore mark', () => {
+  const sanitized = sanitizePages([
+    positionedPage([textLine('Texto de abertura completo.', 100)]),
+    positionedPage([textLine('12', 700), textLine('Continuação do texto.', 600)])
+  ])
+  const marked = detectChapters(
+    sanitized.paragraphs,
+    undefined,
+    undefined,
+    undefined,
+    sanitized.pages,
+    normalizeLineMarks([{ pageIndex: 1, lineText: '12', level: 'ignore' }])
+  )
+  assert.equal(marked.length, 1)
+})
+
+test('excludeMarkedLines removes only exact normalized matches', () => {
+  const pages = [
+    { index: 0, lines: [textLine('12', 700), textLine('Texto real.', 684)] },
+    { index: 1, lines: [textLine('12 homens vieram.', 700)] }
+  ]
+  const result = excludeMarkedLines(pages, [
+    { pageIndex: 0, lineText: ' 12 ' },
+    { pageIndex: 1, lineText: '12' }
+  ])
+  assert.deepEqual(result[0].lines.map((line) => line.text), ['Texto real.'])
+  // '12 homens vieram.' não é igualdade exata: mantém-se
+  assert.deepEqual(result[1].lines.map((line) => line.text), ['12 homens vieram.'])
+  assert.equal(normalizeMatchText(' 12 '), '12')
+})
+
+test('insertManualLines adds a top line that joins the previous unfinished paragraph', () => {
+  const missing = 'o livro para uma mesinha e levantando-se e disse que não estava autorizado a sair'
+  const manual = [{ pageIndex: 1, anchor: 'start', text: missing }]
+  const withManual = insertManualLines(
+    [
+      positionedPage([textLine('texto inacabado sem ponto', 100)]),
+      { ...positionedPage([textLine('continuação aqui.', 700)]), index: 1 }
+    ],
+    manual
+  )
+  assert.equal(withManual[1].lines[0].text, missing)
+  const result = sanitizePages(withManual)
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    `texto inacabado sem ponto ${missing}`,
+    'continuação aqui.'
+  ])
+})
+
+test('insertManualLines keeps a short title-like line as subheading', () => {
+  const withManual = insertManualLines(
+    [{ ...positionedPage([textLine('corpo a seguir.', 600)]), index: 0 }],
+    [{ pageIndex: 0, anchor: 'start', text: 'O Regresso' }]
+  )
+  const result = sanitizePages(withManual)
+  const title = result.paragraphs.find((paragraph) => paragraph.text === 'O Regresso')
+  assert.ok(title && title.kind === 'subheading')
+})
+
+test('insertManualLines keeps manual end lines out of header/footer zones', () => {
+  const withManual = insertManualLines(
+    [positionedPage([textLine('corpo.', 400)])],
+    [
+      { pageIndex: 0, anchor: 'start', text: 'topo' },
+      { pageIndex: 0, anchor: 'end', text: 'fundo' }
+    ]
+  )
+  const [top, ...rest] = withManual[0].lines
+  const bottom = rest[rest.length - 1]
+  assert.equal(top.text, 'topo')
+  assert.equal(bottom.text, 'fundo')
+  assert.ok(top.y < pageHeight * 0.95 && top.y > pageHeight * 0.75)
+  assert.ok(bottom.y > pageHeight * 0.05 && bottom.y < pageHeight * 0.2)
+})
+
+test('reorderMarkedLines swaps lines and keeps leftovers', () => {
+  const pages = [
+    positionedPage([
+      textLine('primeira', 700),
+      textLine('segunda', 684),
+      textLine('terceira', 668)
+    ])
+  ]
+  const reordered = reorderMarkedLines(pages, [
+    { pageIndex: 0, orderedTexts: ['segunda', 'primeira', 'terceira'] }
+  ])
+  assert.deepEqual(reordered[0].lines.map((line) => line.text), ['segunda', 'primeira', 'terceira'])
+
+  const partial = reorderMarkedLines(pages, [{ pageIndex: 0, orderedTexts: ['terceira', 'primeira'] }])
+  assert.deepEqual(partial[0].lines.map((line) => line.text), ['terceira', 'primeira', 'segunda'])
+})
+
+test('normalizeManualLines and normalizeLineOrder reject invalid entries', () => {
+  assert.deepEqual(
+    normalizeManualLines([
+      { pageIndex: 1, anchor: 'start', text: ' em falta ' },
+      { pageIndex: 1, anchor: 'middle', text: 'x' },
+      { pageIndex: -1, anchor: 'end', text: 'x' },
+      { pageIndex: 0, anchor: 'end', text: '  ' }
+    ]),
+    [{ pageIndex: 1, anchor: 'start', text: 'em falta' }]
+  )
+  assert.deepEqual(
+    normalizeLineOrder([
+      { pageIndex: 2, orderedTexts: ['b', 'a'] },
+      { pageIndex: 0, orderedTexts: ['só uma'] },
+      { pageIndex: 1, orderedTexts: 'não é array' }
+    ]),
+    [{ pageIndex: 2, orderedTexts: ['b', 'a'] }]
+  )
+})
+
+test('sanitizePages joins a lowercase continuation even when indented at the next page top', () => {
+  const pages = [
+    positionedPage([textLine('Imediatamente bateram à porta, e um homem, que', 100)]),
+    {
+      ...positionedPage([textLine('nunca vira naquela casa, entrou.', 700, { x: 70 })]),
+      index: 1
+    }
+  ]
+  const result = sanitizePages(pages)
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'Imediatamente bateram à porta, e um homem, que nunca vira naquela casa, entrou.'
+  ])
+})
+
+test('sanitizePages joins an unfinished page end with a lowercase start', () => {
+  const pages = [
+    positionedPage([textLine('que presumivelmente estava logo atrás dela para', 100)]),
+    {
+      ...positionedPage([textLine('continuar a ver tudo com atenção.', 700)]),
+      index: 1
+    }
+  ]
+  const result = sanitizePages(pages)
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'que presumivelmente estava logo atrás dela para continuar a ver tudo com atenção.'
+  ])
+})
+
+test('sanitizePages still splits after a finished sentence before a lowercase page start', () => {
+  const pages = [
+    positionedPage([textLine('Ele entrou então na sala.', 100)]),
+    {
+      ...positionedPage([textLine('coisa estranha aconteceu depois.', 700)]),
+      index: 1
+    }
+  ]
+  const result = sanitizePages(pages)
+  assert.equal(result.paragraphs.length, 2)
+})
+
+test('sanitizePages honors an explicit break over a lowercase continuation', () => {
+  const pages = [
+    positionedPage([textLine('Imediatamente bateram à porta, e um homem, que', 100)]),
+    {
+      ...positionedPage([textLine('nunca vira naquela casa, entrou.', 700)]),
+      index: 1
+    }
+  ]
+  const result = sanitizePages(pages, { 1: 'break' })
+  assert.equal(result.paragraphs.length, 2)
+})
+
+test('sanitizePages rejoins a Tesseract paragraph split mid-sentence on the same page', () => {
+  const result = sanitizePages([
+    positionedPage([
+      textLine('Imediatamente bateram à porta, e um homem, que', 700),
+      textLine('', 692),
+      textLine('nunca vira naquela casa, entrou.', 684)
+    ])
+  ])
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'Imediatamente bateram à porta, e um homem, que nunca vira naquela casa, entrou.'
+  ])
+})
+
+test('sanitizePages keeps a blank-line split after a finished sentence', () => {
+  const result = sanitizePages([
+    positionedPage([
+      textLine('Terminou aqui a história.', 700),
+      textLine('', 692),
+      textLine('Novo começo agora mesmo.', 684)
+    ])
+  ])
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'Terminou aqui a história.',
+    'Novo começo agora mesmo.'
+  ])
+})
+
+test('sanitizePages keeps the hyphen of Portuguese fixed compounds', () => {
+  const result = sanitizePages([
+    positionedPage([
+      textLine('Quer que Anna lhe traga o pequeno-', 700),
+      textLine('almoço, disse K. sorrindo.', 684)
+    ])
+  ])
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'Quer que Anna lhe traga o pequeno-almoço, disse K. sorrindo.'
+  ])
+})
+
+test('sanitizePages still strips discretionary hyphens', () => {
+  const result = sanitizePages([
+    positionedPage([
+      textLine('Nunca tal tinha aconteci-', 700),
+      textLine('do naquela manhã fria.', 684)
+    ])
+  ])
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'Nunca tal tinha acontecido naquela manhã fria.'
+  ])
+})
+
+test('sanitizePages strips a misleading ex- prefix', () => {
+  const result = sanitizePages([
+    positionedPage([textLine('texto fora de contex-', 700), textLine('to aqui escrito.', 684)])
+  ])
+  assert.ok(result.paragraphs[0].text.includes('contexto aqui escrito.'))
+})
+
+test('sanitizePages keeps enclitic lhe across a line break', () => {
+  const result = sanitizePages([
+    positionedPage([
+      textLine('O guarda disse-', 700),
+      textLine('lhe o desconhecido.', 684)
+    ])
+  ])
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'O guarda disse-lhe o desconhecido.'
+  ])
+})
+
+test('sanitizePages keeps a compound hyphen across a page boundary', () => {
+  const pages = [
+    positionedPage([textLine('Quer que Anna lhe traga o pequeno-', 100)]),
+    {
+      ...positionedPage([textLine('almoço, disse K. sorrindo.', 700)]),
+      index: 1
+    }
+  ]
+  const result = sanitizePages(pages)
+  assert.deepEqual(result.paragraphs.map((paragraph) => paragraph.text), [
+    'Quer que Anna lhe traga o pequeno-almoço, disse K. sorrindo.'
+  ])
+})
+
+test('repairLeftoverHyphenation keeps compounds but repairs the rest', () => {
+  assert.equal(repairLeftoverHyphenation('o pequeno- almoço'), 'o pequeno-almoço')
+  assert.equal(repairLeftoverHyphenation('dei- xar-se estar'), 'deixar-se estar')
+  assert.equal(repairLeftoverHyphenation('palavra - continua'), 'palavra - continua')
+})
+
+test('hasUserContentOnPage rescues marked pages but not ignore-only ones', () => {
+  const chapter = [{ pageIndex: 4, matchText: 'A detenção', level: 'chapter' }]
+  const ignoreOnly = [{ pageIndex: 4, matchText: '12', level: 'ignore' }]
+  assert.equal(hasUserContentOnPage(4, chapter, []), true)
+  assert.equal(hasUserContentOnPage(4, [], [{ pageIndex: 4, anchor: 'start', text: 'em falta' }]), true)
+  assert.equal(hasUserContentOnPage(4, ignoreOnly, []), false)
+  assert.equal(hasUserContentOnPage(3, chapter, []), false)
+})
+
+test('matchLineMarkExists finds tolerant matches on the marked page', () => {
+  const sanitized = sanitizePages([
+    positionedPage([textLine('Texto de abertura completo.', 100)]),
+    {
+      ...positionedPage([textLine('A detenção isolada aqui.', 700)]),
+      index: 1
+    }
+  ])
+  assert.equal(
+    matchLineMarkExists(sanitized.paragraphs, { pageIndex: 1, matchText: 'A detenção', level: 'chapter' }),
+    true
+  )
+  assert.equal(
+    matchLineMarkExists(sanitized.paragraphs, { pageIndex: 1, matchText: 'Título inexistente', level: 'chapter' }),
+    false
+  )
+  assert.equal(
+    matchLineMarkExists(sanitized.paragraphs, { pageIndex: 0, matchText: 'A detenção', level: 'chapter' }),
+    false
+  )
 })

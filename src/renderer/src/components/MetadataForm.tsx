@@ -22,7 +22,7 @@ function toImageMime(filePath: string): string {
 }
 
 const inputClass =
-  'w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-neutral-900 placeholder-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100 dark:placeholder-neutral-500'
+  'w-full rounded-xl border border-neutral-300 bg-neutral-50 px-3.5 py-2.5 text-neutral-900 placeholder-neutral-400 transition-colors focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 dark:border-white/10 dark:bg-white/5 dark:text-neutral-100 dark:placeholder-neutral-500'
 
 export default function MetadataForm({ value, onChange }: MetadataFormProps) {
   const [coverDataUrl, setCoverDataUrl] = useState<string | null>(null)
@@ -58,7 +58,7 @@ export default function MetadataForm({ value, onChange }: MetadataFormProps) {
   }
 
   return (
-    <div className="grid grid-cols-1 gap-4 rounded-xl bg-neutral-100 p-4 dark:bg-neutral-800 sm:grid-cols-2">
+    <div className="grid grid-cols-1 gap-4 rounded-2xl border border-neutral-200 bg-white p-5 shadow-sm dark:border-white/10 dark:bg-neutral-900 sm:grid-cols-2">
       <div className="sm:col-span-2">
         <label htmlFor="meta-title" className="mb-1 block text-sm font-medium text-neutral-700 dark:text-neutral-300">
           Título <span className="text-red-500">*</span>

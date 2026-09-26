@@ -1,24 +1,28 @@
 import { parentPort } from 'node:worker_threads'
-import { inspectPdf, type PdfPageContent, type TextLine } from '../services/pdfInspector'
+import { inspectPdf, loadPdfDocument, type PdfPageContent, type TextLine } from '../services/pdfInspector'
 import { sanitizePages } from '../services/textSanitizer'
-import type { ExtractionPreview, ExtractionPreviewLine } from '../../renderer/src/types'
+import { assessPageQuality, suggestBoundaries } from '../services/pageBoundaries'
+import { renderPageToImage, normalizeOcrPsm, runOcr } from '../services/ocrService'
+import type { ExtractionPreview, ExtractionPreviewLine, PageOcrResult } from '../../renderer/src/types'
 
 const MAX_PREVIEW_PAGES = 300
 const MAX_LINES_PER_PAGE = 150
 const MAX_TOTAL_LINES = 12_000
 const MAX_LINE_LENGTH = 500
 const MAX_TOTAL_LINE_CHARACTERS = 1_000_000
-const MAX_PARAGRAPHS = 5_000
+const MAX_PARAGRAPHS = 8_000
 const MAX_PARAGRAPH_LENGTH = 2_000
-const MAX_TOTAL_PARAGRAPH_CHARACTERS = 1_000_000
+const MAX_TOTAL_PARAGRAPH_CHARACTERS = 1_500_000
+/** mesmo DPI da conversão: o texto do OCR da preview coincide com o final */
+const PAGE_OCR_DPI = 200
 
-interface PreviewRequest {
-  type: 'preview'
-  filePath: string
-}
+type PreviewRequest =
+  | { type: 'preview'; filePath: string }
+  | { type: 'page-ocr'; filePath: string; pageIndex: number; psm?: unknown }
 
 type PreviewResponse =
-  | { type: 'done'; preview: ExtractionPreview }
+  | { type: 'preview-done'; preview: ExtractionPreview }
+  | { type: 'page-ocr-done'; pageOcr: PageOcrResult }
   | { type: 'error'; message: string }
 
 function post(message: PreviewResponse): void {
@@ -76,16 +80,23 @@ function createBoundedPreview(
   let truncated = pages.length > MAX_PREVIEW_PAGES
   let totalLines = 0
   let totalLineCharacters = 0
+  // Orçamento distribuído: com livros grandes o teto global esgotava-se nas
+  // primeiras páginas e as últimas ficavam com 0 linhas (sem nada para
+  // escolher). Cada página mostra sempre as suas primeiras N linhas.
+  const perPageLineCap = Math.max(
+    25,
+    Math.min(MAX_LINES_PER_PAGE, Math.ceil(MAX_TOTAL_LINES / Math.max(1, pages.length)))
+  )
 
   const previewPages = pages.slice(0, MAX_PREVIEW_PAGES).map((page) => {
     const sourceLines = page.lines ?? []
     const previewLines: ExtractionPreviewLine[] = []
-    if (sourceLines.length > MAX_LINES_PER_PAGE) {
+    if (sourceLines.length > perPageLineCap) {
       truncated = true
     }
 
     for (const line of sourceLines) {
-      if (previewLines.length >= MAX_LINES_PER_PAGE || totalLines >= MAX_TOTAL_LINES) {
+      if (previewLines.length >= perPageLineCap || totalLines >= MAX_TOTAL_LINES) {
         truncated = true
         break
       }
@@ -146,7 +157,24 @@ function createBoundedPreview(
     pageCount: Math.max(0, Math.floor(boundedNumber(pageCount, 0, 10_000_000))),
     pages: previewPages,
     paragraphs: previewParagraphs,
-    truncated
+    truncated,
+    qualities: assessPageQuality(pages.slice(0, MAX_PREVIEW_PAGES)).map((quality) => ({
+      pageIndex: quality.pageIndex,
+      level: quality.level,
+      chars: quality.chars,
+      reason: quality.reason
+    })),
+    boundaries: suggestBoundaries(pages.slice(0, MAX_PREVIEW_PAGES))
+      .slice(0, MAX_PREVIEW_PAGES)
+      .map((boundary) => ({
+        fromPage: boundary.fromPage,
+        toPage: boundary.toPage,
+        suggestion: boundary.suggestion,
+        reason: boundary.reason,
+        tail: boundary.tail.map((line) => boundedText(line, MAX_LINE_LENGTH).text),
+        head: boundary.head.map((line) => boundedText(line, MAX_LINE_LENGTH).text),
+        headIsTitle: boundary.headIsTitle === true
+      }))
   }
 }
 
@@ -168,14 +196,57 @@ async function preview(filePath: string): Promise<ExtractionPreview> {
   )
 }
 
+/**
+ * OCR de UMA página para a pré-visualização: páginas digitalizadas não têm
+ * linhas na camada de texto e sem isto não há nada para escolher. Usa o
+ * mesmo DPI da conversão para o texto coincidir com o resultado final.
+ * As linhas OCR têm coordenadas em unidades PDF (para as caixas) mas nunca
+ * trazem negrito — o Tesseract não deteta peso de fonte.
+ */
+async function pageOcr(filePath: string, pageIndex: number, psm: unknown): Promise<PageOcrResult> {
+  const doc = await loadPdfDocument(filePath)
+  try {
+    if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= doc.numPages) {
+      throw new Error('Página fora do intervalo do PDF.')
+    }
+    const mode = normalizeOcrPsm(psm)
+    const image = await renderPageToImage(doc, pageIndex, PAGE_OCR_DPI)
+    const ocr = await runOcr(image, 'por', 72 / PAGE_OCR_DPI, mode)
+    const sourceLines = (ocr.lines ?? []).filter((line) => line.text.trim())
+    const lines: ExtractionPreviewLine[] = []
+    for (const line of sourceLines.slice(0, MAX_LINES_PER_PAGE)) {
+      const bounded = previewLine(line, MAX_LINE_LENGTH)
+      if (bounded.line.text) {
+        lines.push(bounded.line)
+      }
+    }
+    return {
+      pageIndex,
+      lines,
+      meanConfidence: Math.round(ocr.meanConfidence * 10) / 10,
+      truncated: sourceLines.length > lines.length,
+      psm: mode
+    }
+  } finally {
+    await doc.destroy().catch(() => undefined)
+  }
+}
+
 parentPort?.on('message', async (message: unknown) => {
   const request = message as PreviewRequest | null
-  if (!request || request.type !== 'preview' || typeof request.filePath !== 'string') {
+  if (!request || typeof request.filePath !== 'string') {
     return
   }
 
   try {
-    post({ type: 'done', preview: await preview(request.filePath) })
+    if (request.type === 'page-ocr') {
+      if (!Number.isInteger(request.pageIndex)) {
+        throw new Error('Página inválida para OCR.')
+      }
+      post({ type: 'page-ocr-done', pageOcr: await pageOcr(request.filePath, request.pageIndex, request.psm) })
+    } else if (request.type === 'preview') {
+      post({ type: 'preview-done', preview: await preview(request.filePath) })
+    }
   } catch (error) {
     post({ type: 'error', message: error instanceof Error ? error.message : String(error) })
   } finally {
